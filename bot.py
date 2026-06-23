@@ -71,10 +71,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(reply, parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"Error handling msg: {e}")
+        import traceback
+        logger.error(f"Error handling msg: {e}\n{traceback.format_exc()}")
         await update.message.reply_text(
             "Sorry, something went wrong parsing that. Try rephrasing with a clear time, like 'remind me to call mom tomorrow at 3pm'."
         )
+    
 
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
