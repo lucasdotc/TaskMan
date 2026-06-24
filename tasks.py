@@ -32,7 +32,7 @@ def check_and_send_reminders():
 
 @app.task(name="tasks.send_telegram_message", bind=True, max_retries=3)
 def send_telegram_message(self, chat_id: int, task_description: str, scheduled_for: str):
-    message_text = client.messages.create(
+    response_obj = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=300,
         system=SYSTEM_PROMPT,
@@ -40,6 +40,7 @@ def send_telegram_message(self, chat_id: int, task_description: str, scheduled_f
             {"role": "user", "content": task_description + scheduled_for}
         ]
     )
+    message_text = response_obj.content[0].text
     try:
         response = requests.post(
             f"{TELEGRAM_API_URL}/sendMessage",
