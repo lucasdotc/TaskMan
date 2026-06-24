@@ -3,6 +3,7 @@ anthropic==0.25.0
 celery[redis]==5.3.6
 celery-redbeat==2.2.0
 redis==5.0.4
-psycopg2-binary==2.9.9
+psycopg[binary]
 python-dotenv==1.0.1
 pytz==2024.1
+requests

@@ -1,14 +1,13 @@
-import psycopg2
-import psycopg2.extras
+import psycopg
+from psycopg.rows import dict_row
 import os
 from dotenv import load_dotenv
-
 load_dotenv()
 
 def get_connection():
-    return psycopg2.connect(os.getenv("DATABASE_URL"))
+    return psycopg.connect(os.getenv("DATABASE_URL"))
 
-def save_task(telegram_user_id: int, description: str, due_datetime)-> str:
+def save_task(telegram_user_id: int, description: str, due_datetime) -> str:
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -44,7 +43,7 @@ def save_reminder(task_id: str, scheduled_for) -> None:
 def get_due_reminders():
     conn = get_connection()
     try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
                 SELECT r.id as reminder_id, r.task_id, r.scheduled_for, t.description, t.telegram_user_id
@@ -52,7 +51,7 @@ def get_due_reminders():
                 JOIN tasks t ON t.id = r.task_id
                 WHERE r.sent = FALSE
                     AND r.scheduled_for <= NOW() + INTERVAL '30 seconds'
-                    and t.is_complete = FALSE
+                    AND t.is_complete = FALSE
                 """
             )
             return cur.fetchall()
@@ -74,15 +73,15 @@ def mark_reminder_sent(reminder_id: str) -> None:
 def get_pending_tasks(telegram_user_id: int):
     conn = get_connection()
     try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                """SELECT id , description, due_datetime
+                """SELECT id, description, due_datetime
                 FROM tasks
                 WHERE telegram_user_id = %s
                     AND is_complete = FALSE
                 ORDER BY due_datetime ASC NULLS LAST
                 """,
-                (telegram_user_id)
+                (telegram_user_id,)
             )
             return cur.fetchall()
     finally:
