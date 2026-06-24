@@ -24,12 +24,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID"))
+ALLOWED_USER_IDS = [int(x.strip()) for x in os.getenv("ALLOWED_USER_ID", "").split(",")]
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 USER_TIMEZONE = os.getenv("USER_TIMEZONE", "UTC")
 
 def is_authorized(update: Update) -> bool:
-    return update.effective_user.id == ALLOWED_USER_ID
+    return update.effective_user.id in ALLOWED_USER_IDS
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
