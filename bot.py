@@ -3,16 +3,17 @@ import logging
 from datetime import datetime
 import pytz
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes
 )
 from claude import parse_task
-from db import save_task, save_reminder, get_pending_tasks, mark_task_complete
+from db import save_task, save_reminder, get_pending_tasks, mark_task_complete, clear_all_tasks
 
 load_dotenv()
 
@@ -103,45 +104,129 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
-    
+
     if not context.args:
         await update.message.reply_text(
-            "Usage: /done <task_id>\nGet task IDs from /list"
+            "Usage: /done <task_id or description>\nGet task IDs from /list"
         )
         return
-    partial_id = context.args[0]
+
+    input_text = " ".join(context.args)
+    tasks = get_pending_tasks(update.effective_user.id)
+
+    matched_by_id = [t for t in tasks if str(t["id"]).startswith(input_text)]
+    if len(matched_by_id) == 1:
+        task = matched_by_id[0]
+        mark_task_complete(str(task["id"]))
+        await update.message.reply_text(f"Marked complete: *{task['description']}*", parse_mode="Markdown")
+        return
+
+    input_lower = input_text.lower()
+    matched_by_desc = [t for t in tasks if input_lower in t["description"].lower()]
+
+    if len(matched_by_desc) == 1:
+        task = matched_by_desc[0]
+        mark_task_complete(str(task["id"]))
+        await update.message.reply_text(f"Marked complete: *{task['description']}*", parse_mode="Markdown")
+        return
+
+    if len(matched_by_desc) > 1:
+        local_tz = pytz.timezone(USER_TIMEZONE)
+        keyboard = []
+        for task in matched_by_desc:
+            due_str = ""
+            if task["due_datetime"]:
+                local_due = task["due_datetime"].astimezone(local_tz)
+                due_str = f" (due {local_due.strftime('%b %d at %I:%M %p')})"
+            keyboard.append([InlineKeyboardButton(
+                f"{task['description']}{due_str}",
+                callback_data=f"done_{task['id']}"
+            )])
+        keyboard.append([InlineKeyboardButton("Cancel", callback_data="done_cancel")])
+        await update.message.reply_text(
+            f"Multiple tasks match \"{input_text}\". Which one?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    if not tasks:
+        await update.message.reply_text("No pending tasks found.")
+        return
+
+    local_tz = pytz.timezone(USER_TIMEZONE)
+    lines = [f"No task matching \"{input_text}\". Here are your pending tasks:\n"]
+    for i, task in enumerate(tasks, 1):
+        due_str = ""
+        if task["due_datetime"]:
+            local_due = task["due_datetime"].astimezone(local_tz)
+            due_str = f" -- due {local_due.strftime('%b %d at %I:%M %p')}"
+        lines.append(f"{i}. {task['description']}{due_str}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "done_cancel":
+        await query.edit_message_text("Cancelled.")
+        return
+
+    task_id = query.data.removeprefix("done_")
+    tasks = get_pending_tasks(query.from_user.id)
+    task = next((t for t in tasks if str(t["id"]) == task_id), None)
+
+    if not task:
+        await query.edit_message_text("Task not found or already completed.")
+        return
+
+    mark_task_complete(task_id)
+    await query.edit_message_text(f"Marked complete: *{task['description']}*", parse_mode="Markdown")
+
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
 
     tasks = get_pending_tasks(update.effective_user.id)
-    matched = [t for t in tasks if str(t["id"]).startswith(partial_id)]
-
-    if not matched:
-        await update.message.reply_text(f"No task found with ID starting with `{partial_id}`")
+    if not tasks:
+        await update.message.reply_text("No pending tasks to clear.")
         return
 
-    if len(matched) > 1:
-        await update.message.reply_text("Multiple tasks match that ID. Use more characters.")
-        return
+    keyboard = [[
+        InlineKeyboardButton("Yes, delete all", callback_data="clear_confirm"),
+        InlineKeyboardButton("Cancel", callback_data="clear_cancel"),
+    ]]
+    await update.message.reply_text(
+        f"Are you sure you want to delete all {len(tasks)} pending task(s)? This cannot be undone.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
-    task = matched[0]
-    mark_task_complete(str(task["id"]))
-    await update.message.reply_text(f"Marked complete: *{task['description']}", parse_mode="Markdown")
+
+async def clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "clear_confirm":
+        count = clear_all_tasks(query.from_user.id)
+        await query.edit_message_text(f"Cleared {count} task(s).")
+    else:
+        await query.edit_message_text("Clear cancelled.")
+
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /start command — welcome message shown when someone first opens the bot.
-    """
     if not is_authorized(update):
         return
 
     await update.message.reply_text(
-        "👋 Hi! I'm your personal reminder bot.\n\n"
+        "Hi! I'm your personal reminder bot.\n\n"
         "Just tell me what you need to remember, for example:\n"
-        "• *remind me to call mom tonight at 8pm*\n"
-        "• *buy groceries tomorrow morning*\n"
-        "• *submit application by Friday at 5pm*\n\n"
+        "- *remind me to call mom tonight at 8pm*\n"
+        "- *buy groceries tomorrow morning*\n"
+        "- *submit application by Friday at 5pm*\n\n"
         "Commands:\n"
-        "/list — see all pending tasks\n"
-        "/done <id> — mark a task complete",
+        "/list -- see all pending tasks\n"
+        "/done <id or description> -- mark a task complete\n"
+        "/clear -- remove all pending tasks",
         parse_mode="Markdown"
     )
 
@@ -155,10 +240,12 @@ def main():
     """
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Register handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("list", list_tasks))
     app.add_handler(CommandHandler("done", done_command))
+    app.add_handler(CommandHandler("clear", clear_command))
+    app.add_handler(CallbackQueryHandler(clear_callback, pattern="^clear_"))
+    app.add_handler(CallbackQueryHandler(done_callback, pattern="^done_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Start the bot with webhook

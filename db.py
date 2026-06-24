@@ -93,9 +93,31 @@ def mark_task_complete(task_id: str) -> None:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE tasks SET sent = TRUE WHERE task_id = %s",
-                (task_id)
+                "UPDATE tasks SET is_complete = TRUE WHERE id = %s",
+                (task_id,)
             )
         conn.commit()
+    finally:
+        conn.close()
+
+def clear_all_tasks(telegram_user_id: int) -> int:
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE reminders SET sent = TRUE
+                WHERE task_id IN (
+                    SELECT id FROM tasks
+                    WHERE telegram_user_id = %s AND is_complete = FALSE
+                )""",
+                (telegram_user_id,)
+            )
+            cur.execute(
+                "UPDATE tasks SET is_complete = TRUE WHERE telegram_user_id = %s AND is_complete = FALSE",
+                (telegram_user_id,)
+            )
+            count = cur.rowcount
+        conn.commit()
+        return count
     finally:
         conn.close()
