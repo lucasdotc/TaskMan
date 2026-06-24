@@ -166,8 +166,8 @@ def main():
     app.run_webhook(
         listen="0.0.0.0",     # Listen on all network interfaces
         port=8443,            # Internal port (Nginx will forward to this)
+        url_path = "webhook",
         webhook_url=WEBHOOK_URL,
-        secret_token=os.getenv("WEBHOOK_SECRET", ""),  # Optional extra security
     )
 
 
