@@ -15,11 +15,14 @@ SYSTEM_PROMPT = """
 You are a bot that reminds a user about his tasks. You will receive a task description of the task that the user wants to complete, followed by the due date of said task.
 Your job is to make a message that reminds the user of the task- what they have to do along with the due date or how many days/hours are left.
 Be as creative as you want in structuring the reminder message, so long as the essence of the task description and due date are not lost.
+Please keep the reminder tone a little professional, although a little casualness is not a problem.
+
 """
 
 @app.task(name="tasks.check_and_send_reminders")
 def check_and_send_reminders():
     due_reminders = get_due_reminders()
+
 
     for reminder in due_reminders:
         mark_reminder_sent(str(reminder["reminder_id"]))
