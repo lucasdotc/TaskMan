@@ -89,7 +89,7 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     local_tz = pytz.timezone(USER_TIMEZONE)
-    lines = ["Your pending tasks:*\n"]
+    lines = ["*Your pending tasks:*\n"]
 
     for i, task in enumerate(tasks, 1):
         due_str = ""
