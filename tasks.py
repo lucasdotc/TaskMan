@@ -33,7 +33,7 @@ def check_and_send_reminders():
             task_description=reminder["description"],
             scheduled_for=str(reminder["scheduled_for"]),
             task_id=str(reminder["task_id"]),
-            recurrence_rule=reminder.get("recurrance_rule")
+            recurrence_rule=reminder.get("recurrence_rule")
         )
 
 @app.task(name="tasks.send_telegram_message", bind=True, max_retries=3)
@@ -75,7 +75,12 @@ def get_next_occurrence(current_time, recurrence_rule: str):
     elif recurrence_rule == "weekly":
         return current_time + timedelta(weeks=1)
     elif recurrence_rule == "monthly":
-        return current_time.replace(month=current_time.month + 1)
+        month = current_time.month % 12 + 1
+        year = current_time.year + (1 if current_time.month == 12 else 0)
+        import calendar
+        max_day = calendar.monthrange(year, month)[1]
+        day = min(current_time.day, max_day)
+        return current_time.replace(year=year, month=month, day=day)
     elif recurrence_rule == "weekdays":
         next_time = current_time + timedelta(days=1)
         while next_time.weekday() >= 5:  

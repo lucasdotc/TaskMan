@@ -80,8 +80,8 @@ Possible intents:
 "list_tasks": The user wants all their current/pending tasks listed.
 "complete_task": The user wants to mark a task as done.
 "delete_task": The user wants to remove a task from the list.
-"clear_tasks:" The user wants to clear their list of tasks.
-"unknown:": Anything else.
+"clear_tasks": The user wants to clear their list of tasks.
+"unknown": Anything else.
 
 Return this schema:
 {
@@ -124,7 +124,7 @@ async def fuzzy_match(user_message: str, tasks: list):
         max_tokens=100,
         system="You are to match a user's message to a Task ID from the task list. Return ONLY the ID that best matches, or NONE if nothing matches.",
         messages=[
-            {"role:":"user", "content": f"User said: '{user_message}' \n\nTasks:\n{task_list}"}
+            {"role":"user", "content": f"User said: '{user_message}' \n\nTasks:\n{task_list}"}
         ]
     )
     result = response.content[0].text.strip()

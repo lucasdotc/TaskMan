@@ -14,7 +14,7 @@ def save_task(telegram_user_id: int, description: str, due_datetime, recurrence_
             cur.execute(
                 """
                 INSERT INTO tasks (telegram_user_id, description, due_datetime, recurrence_rule)
-                VALUES(%s, %s, %s)
+                VALUES(%s, %s, %s, %s)
                 RETURNING id
                 """,
                 (telegram_user_id, description, due_datetime, recurrence_rule)

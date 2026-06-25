@@ -47,13 +47,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if intent == "add_task":
             await add_task(update, user_message)
         elif intent == "list_tasks":
-            await list_tasks(update)
-        elif intent == "complete_tasks":
+            await list_tasks(update, context)
+        elif intent == "complete_task":
             await process_task(update, user_message, "complete")
-        elif intent == "delete_tasks":
+        elif intent == "delete_task":
             await process_task(update, user_message, "delete")
         elif intent == "clear_tasks":
-           await clear_command(update)
+           await clear_command(update, context)
         else:
             await update.message.reply_text(
                 "I'm not sure what you mean. Try something like:\n"
@@ -76,18 +76,20 @@ async def add_task(update: Update, user_message: str):
 
     description = parsed["description"]
     due_datetime = parsed.get("due_datetime")
+    recurrence_rule = parsed.get("recurrence_rule")
     offsets = parsed.get("reminder_offsets_minutes", [0])
 
     task_id = save_task(
     telegram_user_id=update.effective_user.id,
     description=description,
-    due_datetime=due_datetime
+    due_datetime=due_datetime,
+    recurrence_rule=recurrence_rule
     )
 
     if due_datetime:
         for offset_minutes in offsets:
             from datetime import timedelta
-            reminder_time = due_datetime - timedelta(offset_minutes)
+            reminder_time = due_datetime - timedelta(minutes=offset_minutes)
 
             if reminder_time > datetime.now(pytz.utc):
                 save_reminder(task_id, reminder_time)
@@ -123,11 +125,13 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             due_str = f"-- due {local_due.strftime('%b %d at %I:%M %p')}"
         lines.append(f"{i}. {task['description']}{due_str}\n    ID: `{str(task['id'])[:8]}...`")
 
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def process_task(update: Update, user_message: str, cmd: str):
     tasks = get_pending_tasks(update.effective_user.id)
     task_id = await fuzzy_match(user_message, tasks)
+    if task_id == None:
+        await update.message.reply_text("I could not find a task with that description. Use /list to see all of your active tasks.")
     task = next((t for t in tasks if str(t["id"]) == task_id), None)
     mark_task_complete(task_id)
     if cmd == "complete":
