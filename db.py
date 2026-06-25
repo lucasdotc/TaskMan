@@ -7,17 +7,17 @@ load_dotenv()
 def get_connection():
     return psycopg.connect(os.getenv("DATABASE_URL"))
 
-def save_task(telegram_user_id: int, description: str, due_datetime) -> str:
+def save_task(telegram_user_id: int, description: str, due_datetime, recurrence_rule: str = None) -> str:
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO tasks (telegram_user_id, description, due_datetime)
+                INSERT INTO tasks (telegram_user_id, description, due_datetime, recurrence_rule)
                 VALUES(%s, %s, %s)
                 RETURNING id
                 """,
-                (telegram_user_id, description, due_datetime)
+                (telegram_user_id, description, due_datetime, recurrence_rule)
             )
             task_id = cur.fetchone()[0]
             conn.commit()
@@ -46,7 +46,7 @@ def get_due_reminders():
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
-                SELECT r.id as reminder_id, r.task_id, r.scheduled_for, t.description, t.telegram_user_id
+                SELECT r.id as reminder_id, r.task_id, r.scheduled_for, t.description, t.telegram_user_id, t.recurrence_rule
                 FROM reminders r
                 JOIN tasks t ON t.id = r.task_id
                 WHERE r.sent = FALSE

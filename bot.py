@@ -12,7 +12,7 @@ from telegram.ext import (
     filters,
     ContextTypes
 )
-from claude import parse_task
+from claude import parse_task, parse_intent, fuzzy_match
 from db import save_task, save_reminder, get_pending_tasks, mark_task_complete, clear_all_tasks
 
 load_dotenv()
@@ -41,43 +41,67 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Working...")
 
     try:
-        parsed = parse_task(user_message, timezone=USER_TIMEZONE)
-        logger.info(f"Parsed task: {parsed}")
+        intent_result = parse_intent(user_message)
+        intent = intent_result["intent"]
 
-        description = parsed["description"]
-        due_datetime = parsed.get("due_datetime")
-        offsets = parsed.get("reminder_offsets_minutes", [0])
-
-        task_id = save_task(
-            telegram_user_id=update.effective_user.id,
-            description=description,
-            due_datetime=due_datetime
-        )
-
-        if due_datetime:
-            for offset_minutes in offsets:
-                from datetime import timedelta
-                reminder_time = due_datetime - timedelta(offset_minutes)
-
-                if reminder_time > datetime.now(pytz.utc):
-                    save_reminder(task_id, reminder_time)
-
-        if due_datetime:
-            local_tz = pytz.timezone(USER_TIMEZONE)
-            local_due = due_datetime.astimezone(local_tz)
-            due_str = local_due.strftime("%A, %b %d at %I:%M %p")
-            reply = f"Saved. I will remind you to *{description}* on {due_str}."
+        if intent == "add_task":
+            await add_task(update, user_message)
+        elif intent == "list_tasks":
+            await list_tasks(update)
+        elif intent == "complete_tasks":
+            await process_task(update, user_message, "complete")
+        elif intent == "delete_tasks":
+            await process_task(update, user_message, "delete")
+        elif intent == "clear_tasks":
+           await clear_command(update)
         else:
-            reply = f"Saved: *{description}* (no due date set - use /list to see all tasks)"
+            await update.message.reply_text(
+                "I'm not sure what you mean. Try something like:\n"
+                "• 'Remind me to call mom tomorrow at 3pm'\n"
+                "• 'What tasks do I have?'\n"
+                "• 'Mark the dentist one as done'"
+            )
 
-        await update.message.reply_text(reply, parse_mode="Markdown")
+
     except Exception as e:
         import traceback
         logger.error(f"Error handling msg: {e}\n{traceback.format_exc()}")
         await update.message.reply_text(
             "Sorry, something went wrong parsing that. Try rephrasing with a clear time, like 'remind me to call mom tomorrow at 3pm'."
         )
-    
+
+async def add_task(update: Update, user_message: str):
+    parsed = parse_task(user_message, timezone=USER_TIMEZONE)
+    logger.info(f"Parsed task: {parsed}")
+
+    description = parsed["description"]
+    due_datetime = parsed.get("due_datetime")
+    offsets = parsed.get("reminder_offsets_minutes", [0])
+
+    task_id = save_task(
+    telegram_user_id=update.effective_user.id,
+    description=description,
+    due_datetime=due_datetime
+    )
+
+    if due_datetime:
+        for offset_minutes in offsets:
+            from datetime import timedelta
+            reminder_time = due_datetime - timedelta(offset_minutes)
+
+            if reminder_time > datetime.now(pytz.utc):
+                save_reminder(task_id, reminder_time)
+
+    if due_datetime:
+        local_tz = pytz.timezone(USER_TIMEZONE)
+        local_due = due_datetime.astimezone(local_tz)
+        due_str = local_due.strftime("%A, %b %d at %I:%M %p")
+        reply = f"Saved. I will remind you to *{description}* on {due_str}."
+    else:
+        reply = f"Saved: *{description}* (no due date set - use /list to see all tasks)"
+
+    await update.message.reply_text(reply, parse_mode="Markdown")
+    pass
 
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -100,6 +124,16 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{i}. {task['description']}{due_str}\n    ID: `{str(task['id'])[:8]}...`")
 
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def process_task(update: Update, user_message: str, cmd: str):
+    tasks = get_pending_tasks(update.effective_user.id)
+    task_id = await fuzzy_match(user_message, tasks)
+    task = next((t for t in tasks if str(t["id"]) == task_id), None)
+    mark_task_complete(task_id)
+    if cmd == "complete":
+        await update.message.reply_text(f"Marked complete: *{task['description']}*", parse_mode="Markdown")
+    elif cmd == "delete":
+        await update.message.reply_text(f"Deleted: *{task['description']}*", parse_mode="Markdown")
 
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):

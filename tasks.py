@@ -2,8 +2,9 @@ import os
 import anthropic
 import requests
 from celery_app import app
-from db import get_due_reminders, mark_reminder_sent
+from db import get_due_reminders, mark_reminder_sent, save_reminder
 from dotenv import load_dotenv
+from datetime import timedelta
 
 load_dotenv()
 
@@ -30,11 +31,13 @@ def check_and_send_reminders():
         send_telegram_message.delay(
             chat_id=reminder["telegram_user_id"],
             task_description=reminder["description"],
-            scheduled_for=str(reminder["scheduled_for"])
+            scheduled_for=str(reminder["scheduled_for"]),
+            task_id=str(reminder["task_id"]),
+            recurrence_rule=reminder.get("recurrance_rule")
         )
 
 @app.task(name="tasks.send_telegram_message", bind=True, max_retries=3)
-def send_telegram_message(self, chat_id: int, task_description: str, scheduled_for: str):
+def send_telegram_message(self, chat_id: int, task_description: str, scheduled_for: str, task_id, recurrence_rule=None):
     response_obj = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=300,
@@ -58,4 +61,25 @@ def send_telegram_message(self, chat_id: int, task_description: str, scheduled_f
     
     except requests.RequestException as exc:
         raise self.retry(exc=exc, countdown=60 * (self.request.retries + 1))
+    
+    if recurrence_rule:
+        from datetime import datetime, timezone
+        current_time = datetime.fromisoformat(scheduled_for)
+        next_time = get_next_occurrence(current_time, recurrence_rule)
+        if next_time:
+            save_reminder(task_id, next_time)
+    
+def get_next_occurrence(current_time, recurrence_rule: str):
+    if recurrence_rule == "daily":
+        return current_time + timedelta(days=1)
+    elif recurrence_rule == "weekly":
+        return current_time + timedelta(weeks=1)
+    elif recurrence_rule == "monthly":
+        return current_time.replace(month=current_time.month + 1)
+    elif recurrence_rule == "weekdays":
+        next_time = current_time + timedelta(days=1)
+        while next_time.weekday() >= 5:  
+            next_time += timedelta(days=1)
+        return next_time
+    return None
     
