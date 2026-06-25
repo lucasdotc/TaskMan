@@ -1,5 +1,6 @@
 import anthropic
 import json
+import re
 import os
 from datetime import datetime
 import pytz
@@ -115,7 +116,14 @@ def parse_intent(user_message: str)->dict:
             {"role": "user", "content": user_message}
         ]
     )
-    return json.loads(message.content[0].text.strip())
+    raw = message.content[0].text.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        return {"intent": "other", "raw_message": user_message}
 
 async def fuzzy_match(user_message: str, tasks: list):
     task_list = "\n".join([f"ID: {t['id']} — {t['description']}" for t in tasks])
