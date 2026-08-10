@@ -1,0 +1,27 @@
+# systemd unit for running the bot as a long-lived service.
+#
+# Install:
+#   sudo cp deploy/taskman.service /etc/systemd/system/taskman.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now taskman
+#
+# Adjust User/WorkingDirectory/ExecStart below if you didn't set the bot up
+# under a "taskman" user at ~/reminder-bot -- see the README's Deployment
+# section for the full walkthrough.
+
+[Unit]
+Description=TaskMan Telegram reminder bot
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=taskman
+WorkingDirectory=/home/taskman/reminder-bot
+EnvironmentFile=/home/taskman/reminder-bot/.env
+ExecStart=/home/taskman/reminder-bot/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

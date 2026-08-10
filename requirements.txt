@@ -1,8 +1,7 @@
-python-telegram-bot==21.3
-anthropic==0.25.0
-celery[redis]==5.3.6
-celery-redbeat==2.2.0
-redis==5.0.4
+python-telegram-bot==22.8
+anthropic==0.121.0
+openai==1.109.1
+APScheduler==3.10.4
 psycopg[binary]
 python-dotenv==1.0.1
 pytz==2024.1

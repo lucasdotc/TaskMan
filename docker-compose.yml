@@ -1,0 +1,53 @@
+# Runs the whole stack -- bot + Postgres -- as two containers. This is the
+# Docker-native alternative to the systemd + venv + host-installed-Postgres
+# setup documented in deploy/taskman.service; use whichever fits the host
+# better. On a machine that already has Docker (like this one), this path
+# skips setting up a Python venv and a system Postgres install entirely.
+#
+# Usage:
+#   docker compose up -d --build
+#   docker compose logs -f bot
+#
+# Postgres credentials come from POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB
+# in .env -- Compose automatically reads a file literally named ".env" in
+# this directory for ${VAR} substitution below, no extra config needed.
+# Those three values need to match the user/password/db embedded in
+# DATABASE_URL (also in .env, but read by the bot itself, not by Compose) --
+# see the comments in .env.example.
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # The official Postgres image automatically runs any .sql file it
+      # finds here, exactly once, the first time the data volume is
+      # created. This is what applies schema.sql with no manual migration
+      # step -- delete the volume (docker compose down -v) if you ever need
+      # it to re-run against a clean database.
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        # Waits for the healthcheck above, not just "container started" --
+        # without this, the bot can win the race and try to connect before
+        # Postgres is actually accepting connections yet.
+        condition: service_healthy
+
+volumes:
+  postgres_data:
