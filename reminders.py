@@ -17,7 +17,10 @@ import anthropic
 import pytz
 import requests
 from dotenv import load_dotenv
-from db import get_due_reminders, mark_reminder_sent, save_reminder
+from db import (
+    get_due_reminders, mark_reminder_sent, save_reminder,
+    get_overdue_tasks_needing_reminder, mark_overdue_reminder_sent,
+)
 
 load_dotenv()
 
@@ -72,6 +75,39 @@ async def check_and_send_reminders():
             # stop the rest of the batch from being delivered.
             logger.exception(f"Failed to deliver reminder for task {reminder['task_id']}")
 
+async def _post_to_telegram(chat_id: int, text: str, task_id: str) -> bool:
+    """
+    Shared retry-with-backoff POST to Telegram's sendMessage API, used by
+    both the due-time reminders below and the overdue nudges further down
+    -- they only differ in what message gets generated, not in how it gets
+    delivered. Retries up to 3 times with a short backoff (5s, 10s, 15s) on
+    a network error. Returns whether delivery actually succeeded, so
+    callers can decide what "success" should mean for their own
+    bookkeeping (see check_overdue_tasks for why that matters there).
+    """
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            response = requests.post(
+                f"{TELEGRAM_API_URL}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": "Markdown"
+                },
+                timeout=10
+            )
+            response.raise_for_status()
+            return True
+        except requests.RequestException as exc:
+            if attempt == max_attempts - 1:
+                logger.error(f"Giving up sending message for task {task_id} to {chat_id}: {exc}")
+                return False
+            wait_seconds = 5 * (attempt + 1)
+            logger.warning(f"Telegram send failed (attempt {attempt + 1}/{max_attempts}), retrying in {wait_seconds}s: {exc}")
+            await asyncio.sleep(wait_seconds)
+    return False
+
 async def send_telegram_message(chat_id: int, task_description: str, scheduled_for: datetime, task_id: str, recurrence_rule: str = None):
     """
     Generates a reminder message with Claude and sends it via the Telegram
@@ -86,11 +122,7 @@ async def send_telegram_message(chat_id: int, task_description: str, scheduled_f
     so a reminder says "3:00 PM" in your own timezone instead of a raw UTC
     timestamp.
 
-    Retries up to 3 times on a network error, waiting longer between each
-    attempt. This is a smaller, in-process version of what Celery's
-    `bind=True, max_retries=3` gave us -- shorter backoff (seconds, not
-    minutes) since a slow retry here blocks this one reminder's delivery
-    rather than tying up a whole separate worker process.
+    Delivery itself (with retries) is handled by _post_to_telegram above.
     """
     local_due = scheduled_for.astimezone(pytz.timezone(USER_TIMEZONE))
     local_due_str = local_due.strftime("%A, %b %d at %I:%M %p %Z")
@@ -111,27 +143,9 @@ async def send_telegram_message(chat_id: int, task_description: str, scheduled_f
         logger.exception(f"Claude failed to generate reminder text for task {task_id}, falling back to plain text")
         message_text = f"Reminder: {task_description} (due {local_due_str})"
 
-    max_attempts = 3
-    for attempt in range(max_attempts):
-        try:
-            response = requests.post(
-                f"{TELEGRAM_API_URL}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": message_text,
-                    "parse_mode": "Markdown"
-                },
-                timeout=10
-            )
-            response.raise_for_status()
-            break
-        except requests.RequestException as exc:
-            if attempt == max_attempts - 1:
-                logger.error(f"Giving up sending reminder for task {task_id} to {chat_id}: {exc}")
-                return
-            wait_seconds = 5 * (attempt + 1)
-            logger.warning(f"Telegram send failed (attempt {attempt + 1}/{max_attempts}), retrying in {wait_seconds}s: {exc}")
-            await asyncio.sleep(wait_seconds)
+    delivered = await _post_to_telegram(chat_id, message_text, task_id)
+    if not delivered:
+        return
 
     if recurrence_rule:
         # scheduled_for is already a datetime -- no need to round-trip it
@@ -157,3 +171,97 @@ def get_next_occurrence(current_time, recurrence_rule: str):
             next_time += timedelta(days=1)
         return next_time
     return None
+
+# ---------------------------------------------------------------------------
+# Overdue nudges
+#
+# Everything above delivers reminders you scheduled in advance -- each one
+# fires exactly once. This section is a different, independent mechanism:
+# once a task's due time has passed and it's still incomplete, it keeps
+# getting nudged on a repeating schedule (how often depends on priority)
+# until you complete it. See check_overdue_tasks(), scheduled as its own
+# APScheduler job in bot.py's post_init, right alongside
+# check_and_send_reminders.
+# ---------------------------------------------------------------------------
+
+OVERDUE_SYSTEM_PROMPT = """
+You write overdue-task nudges for a task management bot. You will receive a task
+description and how long it has been overdue. Write a short message reminding the
+user it still isn't done.
+
+Rules:
+- Plain, professional, businesslike tone -- no emojis, no jokes, no guilt-tripping.
+- Mention that it's overdue and roughly by how much (e.g. "overdue by 3 hours").
+- One or two sentences. Do not pad it out.
+"""
+
+def _format_overdue_duration(overdue_by: timedelta) -> str:
+    hours = overdue_by.total_seconds() / 3600
+    if hours < 24:
+        rounded = max(1, round(hours))
+        return f"{rounded} hour{'s' if rounded != 1 else ''}"
+    days = round(hours / 24)
+    return f"{days} day{'s' if days != 1 else ''}"
+
+async def send_overdue_reminder(chat_id: int, task_description: str, due_datetime: datetime, task_id: str) -> bool:
+    """
+    Generates and sends one "still overdue" nudge. Returns whether it was
+    actually delivered -- check_overdue_tasks uses that to decide whether
+    to update last_overdue_reminder_at (see the comment there for why that
+    matters, unlike the due-time reminders above).
+    """
+    local_due = due_datetime.astimezone(pytz.timezone(USER_TIMEZONE))
+    overdue_str = _format_overdue_duration(datetime.now(pytz.utc) - due_datetime)
+
+    try:
+        response_obj = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=200,
+            system=OVERDUE_SYSTEM_PROMPT,
+            messages=[
+                {"role": "user", "content": f"Task: {task_description}\nOverdue by: {overdue_str} (was due {local_due.strftime('%A, %b %d at %I:%M %p %Z')})"}
+            ]
+        )
+        message_text = response_obj.content[0].text
+    except Exception:
+        logger.exception(f"Claude failed to generate overdue nudge for task {task_id}, falling back to plain text")
+        message_text = f"Still overdue by {overdue_str}: {task_description}"
+
+    return await _post_to_telegram(chat_id, message_text, task_id)
+
+async def check_overdue_tasks():
+    """
+    Runs every 60 seconds (see bot.py), independently of
+    check_and_send_reminders. Finds tasks that are overdue and haven't been
+    nudged recently enough for their priority (see
+    get_overdue_tasks_needing_reminder in db.py for the exact cadence), and
+    sends one nudge per task.
+
+    Unlike check_and_send_reminders, which marks a reminder sent *before*
+    attempting delivery (better to occasionally miss a one-time reminder
+    than double-send it), this only records the nudge as sent *after* a
+    successful delivery. That's the opposite tradeoff, deliberately: an
+    overdue nudge isn't one-time, it repeats on its own next tick regardless,
+    so there's no risk of double-sending by retrying -- but recording it as
+    sent on a failed delivery would mean waiting a full extra interval (up
+    to 24 hours) before trying again, which is a worse outcome than just
+    trying again in 60 seconds.
+    """
+    try:
+        overdue_tasks = get_overdue_tasks_needing_reminder()
+    except Exception:
+        logger.exception("Failed to fetch overdue tasks")
+        return
+
+    for task in overdue_tasks:
+        try:
+            delivered = await send_overdue_reminder(
+                chat_id=task["telegram_user_id"],
+                task_description=task["description"],
+                due_datetime=task["due_datetime"],
+                task_id=str(task["id"])
+            )
+            if delivered:
+                mark_overdue_reminder_sent(str(task["id"]))
+        except Exception:
+            logger.exception(f"Failed to send overdue nudge for task {task['id']}")

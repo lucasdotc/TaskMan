@@ -2,6 +2,8 @@
 
 A personal Telegram task manager and reminder bot powered by Claude AI. Send natural language messages like *"remind me to call mom tomorrow at 3pm"* and the bot parses, stores, and delivers the reminder at the right time. You can also just send a voice message instead of typing.
 
+This README covers how the bot is built and deployed. For a plain-language walkthrough of how to actually use it in Telegram, see **[USAGE.md](USAGE.md)**.
+
 ---
 
 ## Architecture Overview
@@ -21,14 +23,18 @@ bot.py  (python-telegram-bot, one process, one event loop)
      ├── voice.py transcribes voice/audio messages first
      ├── calls claude.py to detect intent
      ├── calls claude.py to parse the task
+     ├── calls embeddings.py to embed the task description
      ├── calls db.py to save task + reminders
      ├── replies to you in Telegram
      │
-     └── an APScheduler job (started in post_init, see bot.py)
-             wakes up every 60 seconds inside this same process
+     └── two APScheduler jobs (started in post_init, see bot.py), both on
+         a 60-second interval, independent of each other
              │
-             ├── calls db.py for due reminders
-             └── calls reminders.py to generate + send each one
+             ├── check_and_send_reminders: calls db.py for due reminders,
+             │   calls reminders.py to generate + send each one
+             │
+             └── check_overdue_tasks: calls db.py for tasks overdue and
+                 due a nudge, calls reminders.py to generate + send each one
 ```
 
 **Why each component exists:**
@@ -38,10 +44,11 @@ bot.py  (python-telegram-bot, one process, one event loop)
 | `bot.py` | Receives messages from Telegram, routes them, replies, owns the reminder scheduler |
 | `claude.py` | Uses Claude API to understand natural language |
 | `voice.py` | Transcribes voice/audio messages to text via OpenAI Whisper |
-| `reminders.py` | Generates and delivers reminder messages; called by the scheduler in `bot.py` |
+| `embeddings.py` | Embeds task descriptions via HuggingFace, for pgvector-based `/done` matching |
+| `reminders.py` | Generates and delivers both due-time reminders and overdue nudges |
 | `db.py` | All database reads and writes |
-| APScheduler | In-process interval timer that fires `check_and_send_reminders` every 60s (see `post_init` in `bot.py`) |
-| PostgreSQL | Persists tasks, reminders, and users across restarts |
+| APScheduler | In-process interval timer running both reminder jobs every 60s (see `post_init` in `bot.py`) |
+| PostgreSQL + pgvector | Persists tasks, reminders, and users; pgvector adds similarity search on task embeddings |
 | systemd | Keeps the process running and restarts it if it crashes |
 
 This used to be two extra processes (a Celery worker and Celery Beat) coordinated through Redis, purely to run "check for due reminders every 60 seconds." APScheduler does the same thing as one scheduled job living inside `bot.py` itself — see the **Reminder scheduling** section below for the tradeoffs of that swap.
@@ -92,7 +99,23 @@ New tasks are the one place this isn't a soft default: while scoped to a categor
 
 `/list` numbers every task it shows (continuously across category groups, not restarting at 1 per group — restarting would make two different tasks both display as "1." in the same message, which is ambiguous). `list_tasks` records that exact ordering in `LAST_LISTED_TASK_IDS`, an in-memory dict keyed by Telegram user ID, right before it sends the message.
 
-That's what lets you say "mark number 1 as done", "delete item 2", or "send #3 to Sarah" instead of describing the task or copy-pasting a UUID — `parse_intent` returns a `list_position` field when it detects this pattern, and `resolve_list_position` looks it up against what that user was last shown, skipping the `fuzzy_match` Claude call entirely. If the task at that position was completed, deleted, or transferred away since the list was shown, the lookup against the *current* pending tasks simply comes up empty and the bot says so — it never acts on stale data. `/done <number>` and `/transfer <number> <recipient>` support the same shorthand for consistency with the natural-language flow. This state is deliberately in-memory only (not the database) since it's tied to one specific message the bot already sent, not data worth surviving a restart.
+That's what lets you say "mark number 1 as done", "delete item 2", or "send #3 to Sarah" instead of describing the task or copy-pasting a UUID — `parse_intent` returns a `list_position` field when it detects this pattern, and `resolve_list_position` looks it up against what that user was last shown, skipping the vector search / `fuzzy_match` Claude call entirely. If the task at that position was completed, deleted, or transferred away since the list was shown, the lookup against the *current* pending tasks simply comes up empty and the bot says so — it never acts on stale data. `/done <number>` and `/transfer <number> <recipient>` support the same shorthand for consistency with the natural-language flow. This state is deliberately in-memory only (not the database) since it's tied to one specific message the bot already sent, not data worth surviving a restart.
+
+**Referring to a task by description -- vector search first, Claude as fallback:**
+
+When you *don't* give a number, `resolve_task_by_description` in `bot.py` is what turns "mark the dentist one as done" into an actual task. It tries two things in order:
+
+1. **pgvector similarity search** (fast, no LLM call): `embed_text` in `embeddings.py` turns your message into a 384-dimension vector via HuggingFace's hosted Inference API (`sentence-transformers/all-MiniLM-L6-v2`), and `find_similar_task` in `db.py` asks Postgres for the pending task whose *stored* embedding (computed the same way, at creation time, from the task's `description`) is closest to it, using pgvector's `<=>` cosine-distance operator. If the closest match's distance is under `VECTOR_MATCH_THRESHOLD` (0.5, a starting guess -- see the TODO about tuning it once there's real usage to judge against), that task is used directly.
+2. **`fuzzy_match` (the original Claude-based approach)** as a fallback, used whenever step 1 isn't confident enough, or embeddings aren't available at all (no `HUGGINGFACE_API_TOKEN` configured, the API call failed, or the task predates this feature and was never embedded). A pure vector search only knows topical similarity -- it has no way to reason about something like "the one due today" -- so a query the vector search can't confidently resolve gets a second chance from an LLM that can actually read the full task list and the phrasing, rather than being rejected outright.
+
+This is deliberately "vector-first, LLM-fallback" rather than a full replacement of `fuzzy_match`: cheaper and faster for the common case, without losing the LLM's ability to handle trickier phrasing. Every call site that used to call `fuzzy_match` directly (`process_task`, `handle_transfer`, `transfer_command`) now goes through `resolve_task_by_description` instead.
+
+**Notes and priority (`/note`, `/priority`):**
+
+Two small, related features, both following the same pattern as everything above: a slash command plus a natural-language equivalent (`add_note`/`view_note`/`set_priority` intents), both resolving the target task the same way (`_resolve_task_for`, by list position or by `resolve_task_by_description`).
+
+- `/note <number> [text]` sets a free-text note (`tasks.notes`) beyond the short description, or shows the current one if you omit the text. The slash command only accepts a *number*, not a free-text task description -- there's no reliable way to tell where a typed description ends and the note text begins (e.g. `/note dentist appointment remember insurance card`), so a free-text reference only works through natural language, where Claude does that splitting for you as structured JSON.
+- `/priority <number> <1|2|3>` sets `tasks.priority`, which controls how often overdue nudges repeat -- see **Overdue nudges** in the `reminders.py` section below. `parse_task` only ever sets a priority when the message explicitly signals urgency ("priority 1", "urgent", "no rush") -- unlike category, it's never guessed from the task's subject matter, since guessing wrong on urgency felt like exactly the kind of thing that should require you to actually say it.
 
 **Bulk actions -- "mark all as done" / "remove all":**
 
@@ -120,11 +143,11 @@ All Claude API interactions live here. There are three main functions:
 
 **`parse_intent(user_message)`**
 
-Sends the user's message to Claude with a prompt that asks it to classify the intent and return JSON. Claude returns one of: `add_task`, `list_tasks`, `complete_task`, `delete_task`, `clear_tasks`, `complete_all_tasks`, `transfer_task`, or `unknown`. `list_tasks`, `clear_tasks`, and `complete_all_tasks` may all return a `category` field if you scoped the request to one; `transfer_task` returns a `recipient_name`; `complete_task`/`delete_task`/`transfer_task` may return a `list_position` (converting words like "first"/"second" to 1/2) when you referred to the task by its position in your last `/list` instead of describing it. `complete_all_tasks` is distinct from `complete_task` specifically so "mark all as done" and "mark the dentist one as done" route to different handlers instead of one intent trying to mean both. This is what makes the bot feel conversational rather than command-driven.
+Sends the user's message to Claude with a prompt that asks it to classify the intent and return JSON. Claude returns one of: `add_task`, `list_tasks`, `complete_task`, `delete_task`, `clear_tasks`, `complete_all_tasks`, `transfer_task`, `add_note`, `view_note`, `set_priority`, or `unknown`. `list_tasks`, `clear_tasks`, and `complete_all_tasks` may all return a `category` field if you scoped the request to one; `transfer_task` returns a `recipient_name`; `add_note` returns a `note_text`; `set_priority` returns a `priority` (1/2/3); `complete_task`/`delete_task`/`transfer_task`/`add_note`/`view_note`/`set_priority` may return a `list_position` (converting words like "first"/"second" to 1/2) when you referred to the task by its position in your last `/list` instead of describing it. `complete_all_tasks` is distinct from `complete_task` specifically so "mark all as done" and "mark the dentist one as done" route to different handlers instead of one intent trying to mean both. This is what makes the bot feel conversational rather than command-driven.
 
 **`parse_task(user_message, timezone)`**
 
-Takes a natural language task description and asks Claude to extract structured data from it — the task description, due date/time in UTC, recurrence rule, reminder offsets, and category. Claude returns JSON which gets parsed and saved to the database.
+Takes a natural language task description and asks Claude to extract structured data from it — the task description, due date/time in UTC, recurrence rule, reminder offsets, category, and priority. Claude returns JSON which gets parsed and saved to the database. Priority is only ever set from an explicit signal ("priority 1", "urgent", "no rush") and stays `null` otherwise — see the **Notes and priority** section under `bot.py` above for why that's treated differently from category, which Claude is allowed to guess from context.
 
 The system prompts use `{{` and `}}` to escape literal JSON braces — Python's `.format()` method interprets `{}` as template variables, so any JSON examples in the prompt need doubled braces to be treated as literal characters.
 
@@ -144,23 +167,39 @@ If you'd rather not depend on OpenAI (cost, or wanting everything self-hosted), 
 
 ---
 
+### `embeddings.py`
+
+Turns text into a semantic embedding vector, for the pgvector-based task matching described under **Referring to a task by description** above.
+
+`embed_text` calls HuggingFace's hosted Inference API (`InferenceClient.feature_extraction`) using `sentence-transformers/all-MiniLM-L6-v2`, a small, well-established sentence-embedding model that outputs 384-dimension vectors (hence `vector(384)` in `schema.sql`). Chosen over an OpenAI embeddings model specifically to avoid adding a *third* paid API vendor alongside Anthropic and OpenAI — HuggingFace's Inference API has a free tier, and this bot's embedding volume (one call per task added, one per match attempt) is tiny.
+
+Two things worth knowing:
+
+- **Returns `None` on any failure** (no `HUGGINGFACE_API_TOKEN` configured, a network error, a HuggingFace outage) rather than raising. Every caller treats a missing embedding the same as "no confident vector match" and falls back to `fuzzy_match` — a HuggingFace problem degrades this one feature rather than breaking task matching entirely.
+- **Handles two possible response shapes.** `feature_extraction` normally returns one pooled vector per input, but depending on the model/endpoint it can come back as one vector *per token* instead. `embed_text` mean-pools across tokens in that case so callers always get a single flat vector either way. This was written without a live HuggingFace token to test against, so it's worth double-checking the actual response shape once real usage exists.
+
+---
+
 ### `db.py`
 
 All database operations. Uses `psycopg` (the modern PostgreSQL driver — `psycopg2` doesn't support Python 3.14) to connect to PostgreSQL.
 
 **Connection pattern:**
 
-Every function opens a connection, does its work, and closes it in a `finally` block so the connection is always released even if an error occurs. This is intentionally simple — a connection pool would be more efficient at scale but adds complexity that isn't needed for a personal bot.
+Every function opens a connection, does its work, and closes it in a `finally` block so the connection is always released even if an error occurs. This is intentionally simple — a connection pool would be more efficient at scale but adds complexity that isn't needed for a personal bot. `get_connection` also calls `pgvector.psycopg.register_vector` on every new connection, which teaches psycopg how to convert a Python list of floats to/from Postgres's `vector` type automatically -- without it, `save_task`'s `embedding` param and `find_similar_task`'s results would need manual vector-literal formatting instead of just passing/receiving plain lists.
 
 **Key functions:**
 
-- `save_task` — inserts a new task (with its category) and returns its UUID
+- `save_task` — inserts a new task (with its category, priority, and embedding) and returns its UUID
 - `save_reminder` — inserts a reminder row linked to a task, with a `scheduled_for` timestamp
 - `get_due_reminders` — returns all reminders where `scheduled_for <= NOW()` and `sent = FALSE` and the parent task isn't complete. Includes a 30-second buffer to catch reminders that are about to fire.
 - `mark_reminder_sent` — sets `sent = TRUE` on a reminder so it doesn't fire again
 - `get_pending_tasks` — returns incomplete tasks for a user, optionally filtered to one category
+- `find_similar_task` — pgvector's `<=>` cosine-distance search for the pending task closest in meaning to a given embedding; see **Referring to a task by description** under `bot.py`
 - `mark_task_complete` — sets `is_complete = TRUE` on a task
 - `mark_all_tasks_complete` — the bulk version: sets `is_complete = TRUE` on every pending task for a user (optionally scoped to a category) and silences their unset reminders. Backs both `/clear` ("remove all") and "mark all as done" — they're the same operation, just worded differently at the call site
+- `set_task_notes` / `set_task_priority` — back `/note` and `/priority`
+- `get_overdue_tasks_needing_reminder` / `mark_overdue_reminder_sent` — back the overdue-nudge job; see **Overdue nudges** under `reminders.py` below
 - `transfer_task` — reassigns a task's `telegram_user_id` to a new owner and records who assigned it
 - `ensure_user` / `set_display_name` / `get_user` / `find_user_by_name` / `get_all_users` — manage the `users` table backing task transfer and `/users` (display names, admin flags)
 - `sync_admins_from_env` — makes `users.is_admin` match `ADMIN_USER_ID` from `.env` on every bot startup; there's no bot command that grants admin, so it can only be changed by editing `.env` on the host and restarting
@@ -171,19 +210,29 @@ The `row_factory=dict_row` argument on cursors makes rows return as dictionaries
 
 ### `reminders.py`
 
-The reminder delivery logic. Used to be two Celery tasks running in a separate worker process; now it's two plain async functions that the APScheduler job in `bot.py` calls directly.
+The reminder delivery logic — two independent mechanisms sharing one file since they both talk to Telegram/Claude the same way, via a shared `_post_to_telegram` retry helper.
 
 **`check_and_send_reminders()`**
 
-The function the scheduler calls every 60 seconds. Calls `get_due_reminders` to find anything that needs to fire, immediately marks each reminder as sent (to prevent double-delivery if delivery takes a while), then delivers each one. Marking sent before delivery is intentional — it's safer to occasionally miss a reminder than to send duplicates. Each delivery is wrapped in its own `try/except` so one failing reminder (bad data, a Telegram error) can't stop the rest of the batch — or crash the scheduler itself, which would silently kill all future reminders until the bot restarts.
+The function one of the two scheduler jobs calls every 60 seconds. Calls `get_due_reminders` to find anything that needs to fire, immediately marks each reminder as sent (to prevent double-delivery if delivery takes a while), then delivers each one. Marking sent before delivery is intentional — it's safer to occasionally miss a reminder than to send duplicates. Each delivery is wrapped in its own `try/except` so one failing reminder (bad data, a Telegram error) can't stop the rest of the batch — or crash the scheduler itself, which would silently kill all future reminders until the bot restarts.
 
 **`send_telegram_message(...)`**
 
-The actual delivery. `scheduled_for` arrives as a timezone-aware UTC datetime straight from the database (everything in the DB is UTC) and is converted to `USER_TIMEZONE` here, once, before it's shown anywhere — so a reminder says "3:00 PM" in your own timezone (Mountain, by default) instead of a raw UTC timestamp. That localized string is what gets sent to Claude to generate a reminder message (falling back to a plain-text reminder with the same localized time if Claude errors, rather than dropping the reminder entirely), then POSTed to the Telegram HTTP API directly with `requests`. The prompt asks for a short, plain, businesslike message — no emojis, no jokes — like a calendar notification rather than a chatty aside. Retries up to 3 times with a short backoff (5s, 10s, 15s) if the Telegram API request fails — a smaller, in-process version of what Celery's `bind=True, max_retries=3` gave us. The backoff is shorter than Celery's (which waited minutes between attempts) because this retry now blocks that one reminder's own delivery rather than being handled by a separate worker.
+The actual delivery. `scheduled_for` arrives as a timezone-aware UTC datetime straight from the database (everything in the DB is UTC) and is converted to `USER_TIMEZONE` here, once, before it's shown anywhere — so a reminder says "3:00 PM" in your own timezone (Mountain, by default) instead of a raw UTC timestamp. That localized string is what gets sent to Claude to generate a reminder message (falling back to a plain-text reminder with the same localized time if Claude errors, rather than dropping the reminder entirely), then handed to `_post_to_telegram`. The prompt asks for a short, plain, businesslike message — no emojis, no jokes — like a calendar notification rather than a chatty aside.
+
+**`_post_to_telegram(chat_id, text, task_id)`**
+
+Shared by both mechanisms in this file: POSTs to Telegram's `sendMessage` API with up to 3 retries and a short backoff (5s, 10s, 15s) — a smaller, in-process version of what Celery's `bind=True, max_retries=3` gave us. Returns whether delivery actually succeeded, which matters differently to its two callers — see **Overdue nudges** below for why.
 
 **Recurring tasks:**
 
 After sending a reminder, if the task has a `recurrence_rule` (`daily`, `weekly`, `weekdays`, `monthly`), `get_next_occurrence` calculates the next fire time and saves a new reminder row. This way recurring tasks perpetually reschedule themselves without any additional logic.
+
+**Overdue nudges:**
+
+A separate, independent mechanism from everything above -- `check_and_send_reminders` delivers reminders you scheduled in advance, each firing exactly once. `check_overdue_tasks` (the other scheduler job, also every 60 seconds) is open-ended instead: once a task's due time passes and it's still incomplete, it keeps getting nudged on a repeating schedule until you complete it, at a cadence set by `tasks.priority` — every hour for priority 1, every 6 hours for priority 2, every 12 for priority 3, every 24 for no priority at all. `get_overdue_tasks_needing_reminder` in `db.py` does the actual cadence math in SQL (a `CASE` on `priority` compared against `last_overdue_reminder_at`); this function just generates and sends the message for whatever it returns, via `send_overdue_reminder`, then calls `mark_overdue_reminder_sent`.
+
+That last step is the one place this file makes the *opposite* tradeoff from `check_and_send_reminders`: it only records a nudge as sent *after* a successful delivery, not before. That's deliberate -- an overdue nudge isn't one-time, so retrying costs nothing (it just tries again on the next 60-second tick regardless), but recording a *failed* delivery as sent would mean waiting up to a full 24 hours before trying again, which is a worse failure mode than a few extra attempts.
 
 ---
 
@@ -205,6 +254,10 @@ psql "$DATABASE_URL" -f schema.sql
 | `recurrence_rule` | TEXT | `daily`, `weekly`, `weekdays`, `monthly`, or null |
 | `category` | TEXT | `personal`, `work`, `school`, or anything else — defaults to `personal` |
 | `assigned_by` | BIGINT | Telegram ID of the admin who transferred this task, or null if the owner created it themselves |
+| `notes` | TEXT | Free-text detail beyond `description`, set/viewed via `/note` — null until set |
+| `priority` | SMALLINT | 1/2/3 or null; controls overdue-nudge frequency — see `reminders.py`'s Overdue nudges |
+| `last_overdue_reminder_at` | TIMESTAMPTZ | When this task last got an overdue nudge; null means never nudged yet |
+| `embedding` | vector(384) | Sentence embedding of `description`, for pgvector similarity search — null if never computed (no HuggingFace token, or predates this feature) |
 | `is_complete` | BOOLEAN | Whether the task is done |
 | `created_at` | TIMESTAMPTZ | When it was created |
 
@@ -233,9 +286,9 @@ Nothing about this stack requires EC2 specifically — it's a Linux box running 
 
 There are two ways to actually run it, and which one to use depends on whether the host already has Docker:
 
-**Docker Compose** (`docker-compose.yml` + `Dockerfile`) — the simpler path on any host that already has Docker. `docker compose up -d --build` builds the bot image and starts it alongside a Postgres container, with `schema.sql` applied automatically the first time (Postgres's official image runs any `.sql` file it finds in `/docker-entrypoint-initdb.d/` once, the first time its data volume is created — no manual migration step). Both services are set to `restart: unless-stopped`, and the bot's `depends_on` waits for a Postgres healthcheck rather than just "container started", so it doesn't lose the startup race and try to connect before Postgres is actually accepting connections. Needs `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` in `.env` matching whatever's embedded in `DATABASE_URL` (see the comments in `.env.example`) — Compose only understands the former for bootstrapping the Postgres container, and doesn't parse `DATABASE_URL` itself.
+**Docker Compose** (`docker-compose.yml` + `Dockerfile`) — the simpler path on any host that already has Docker. `docker compose up -d --build` builds the bot image and starts it alongside a `pgvector/pgvector:pg16` Postgres container (the official Postgres image plus the pgvector extension precompiled in), with `schema.sql` applied automatically the first time (Postgres's image runs any `.sql` file it finds in `/docker-entrypoint-initdb.d/` once, the first time its data volume is created — no manual migration step). Both services are set to `restart: unless-stopped`, and the bot's `depends_on` waits for a Postgres healthcheck rather than just "container started", so it doesn't lose the startup race and try to connect before Postgres is actually accepting connections. Needs `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` in `.env` matching whatever's embedded in `DATABASE_URL` (see the comments in `.env.example`) — Compose only understands the former for bootstrapping the Postgres container, and doesn't parse `DATABASE_URL` itself.
 
-**systemd + a venv + host-installed Postgres** (`deploy/taskman.service`) — for a host without Docker, e.g. a bare cloud VM. `python3 -m venv venv && pip install -r requirements.txt`, install Postgres separately, then the systemd unit runs `venv/bin/python bot.py` directly with `Restart=always`.
+**systemd + a venv + host-installed Postgres** (`deploy/taskman.service`) — for a host without Docker, e.g. a bare cloud VM. `python3 -m venv venv && pip install -r requirements.txt`, install Postgres separately (plus the `postgresql-16-pgvector` package or equivalent for your distro — the stock Postgres package doesn't include the extension), then the systemd unit runs `venv/bin/python bot.py` directly with `Restart=always`.
 
 Currently runs via the systemd path on AWS EC2 (Ubuntu). The Cloudflare Tunnel (`cloudflared.service`) it also used to need, and the recurring "the tunnel URL rotates on every restart, re-register the webhook" annoyance that came with it, are both gone now that the bot doesn't need a public URL at all.
 
@@ -260,9 +313,10 @@ This only works against a directory that's an actual `git clone` (needs `.git` a
 - **Python 3.14**
 - **python-telegram-bot** — polling and the Telegram API
 - **Anthropic Claude API** — intent detection, task parsing, reminder message generation
-- **PostgreSQL** — persistent storage
+- **PostgreSQL + pgvector** — persistent storage, plus similarity search on task embeddings for `/done` matching
 - **psycopg** — PostgreSQL driver (psycopg2 doesn't support Python 3.14)
 - **OpenAI Whisper API** — voice message transcription (Claude doesn't accept audio input)
+- **HuggingFace Inference API** — task-description embeddings (`sentence-transformers/all-MiniLM-L6-v2`), for vector-based task matching
 - **APScheduler** — in-process reminder scheduling (runs every 60s inside the bot process, no broker needed)
 - **AWS EC2** — hosting (not required — see Deployment)
 - **systemd** — process supervision

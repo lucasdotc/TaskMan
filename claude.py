@@ -19,7 +19,8 @@ Return this exact schema:
   "due_datetime": "ISO 8601 datetime string in UTC, or null if no time mentioned",
   "recurrence_rule": "daily | weekly | weekdays | monthly | null",
   "reminder_offsets_minutes": [0],
-  "category": "a short single lowercase word for what kind of task this is"
+  "category": "a short single lowercase word for what kind of task this is",
+  "priority": "1, 2, 3, or null"
 }}
 
 reminder_offsets_minutes controls when to send reminders relative to due_datetime:
@@ -37,24 +38,31 @@ category should classify the task so similar tasks can be grouped later:
   use that word instead
 - Default to "personal" when nothing suggests otherwise
 
+priority should be null UNLESS the user explicitly signals urgency -- never guess it from the
+task's subject matter the way category is guessed:
+- "priority 1", "urgent", "asap", "highest priority" -> 1
+- "priority 2", "medium priority" -> 2
+- "priority 3", "low priority", "no rush", "whenever" -> 3
+- Nothing said about urgency at all -> null (this should be the common case)
+
 Examples:
 User: "remind me to call the dentist tomorrow at 2pm"
-Response: {{"description": "call the dentist", "due_datetime": "2025-01-16T14:00:00Z", "reminder_offsets_minutes": [0, 60, 1440], "category": "personal"}}
+Response: {{"description": "call the dentist", "due_datetime": "2025-01-16T14:00:00Z", "reminder_offsets_minutes": [0, 60, 1440], "category": "personal", "priority": null}}
 
 User: "don't forget to buy groceries"
-Response: {{"description": "buy groceries", "due_datetime": null, "reminder_offsets_minutes": [0], "category": "personal"}}
+Response: {{"description": "buy groceries", "due_datetime": null, "reminder_offsets_minutes": [0], "category": "personal", "priority": null}}
 
 User: "remind me everyday to text my dad at 10:30am"
-Response: {{"description": "text dad", "due_datetime": "2026-06-25T10:30:00Z", "recurrence_rule": "daily", "reminder_offsets_minutes": [0], "category": "personal"}}
+Response: {{"description": "text dad", "due_datetime": "2026-06-25T10:30:00Z", "recurrence_rule": "daily", "reminder_offsets_minutes": [0], "category": "personal", "priority": null}}
 
 User: "remind me to call mom on weekdays at 9am"
-Response: {{"description": "call mom", "due_datetime": "2026-06-26T09:00:00Z", "recurrence_rule": "weekdays", "reminder_offsets_minutes": [0], "category": "personal"}}
+Response: {{"description": "call mom", "due_datetime": "2026-06-26T09:00:00Z", "recurrence_rule": "weekdays", "reminder_offsets_minutes": [0], "category": "personal", "priority": null}}
 
-User: "add a work task to send the Q3 report to my manager by Friday 5pm"
-Response: {{"description": "send Q3 report to manager", "due_datetime": "2026-06-26T17:00:00Z", "reminder_offsets_minutes": [0, 60, 1440], "category": "work"}}
+User: "add a work task to send the Q3 report to my manager by Friday 5pm, this is urgent"
+Response: {{"description": "send Q3 report to manager", "due_datetime": "2026-06-26T17:00:00Z", "reminder_offsets_minutes": [0, 60, 1440], "category": "work", "priority": 1}}
 
 User: "I have a chem lab report due next monday at noon"
-Response: {{"description": "chem lab report", "due_datetime": "2026-06-29T12:00:00Z", "reminder_offsets_minutes": [0, 60, 1440], "category": "school"}}
+Response: {{"description": "chem lab report", "due_datetime": "2026-06-29T12:00:00Z", "reminder_offsets_minutes": [0, 60, 1440], "category": "school", "priority": null}}
 
 Current UTC time: {current_utc}
 User's local timezone: {timezone}
@@ -88,6 +96,13 @@ def parse_task(user_message: str, timezone: str = "America/Edmonton")->dict:
     # Normalize so a missing/blank category (or odd casing from the model)
     # always lands in a predictable bucket instead of null.
     parsed["category"] = (parsed.get("category") or "personal").strip().lower()
+    # priority stays None unless it's genuinely 1/2/3 -- anything else the
+    # model might return (a stray string, an out-of-range number) is
+    # treated as "not set" rather than trusted as-is, since bot.py's
+    # get_overdue_tasks_needing_reminder query only knows what to do with
+    # exactly those three values (see the CHECK constraint in schema.sql).
+    priority = parsed.get("priority")
+    parsed["priority"] = priority if priority in (1, 2, 3) else None
     return parsed
 
 INTENT_PROMPT = """
@@ -112,17 +127,27 @@ Possible intents:
     person by name (e.g. "send the grocery task to Sarah", "assign the report to John").
     Include a "recipient_name" field with that person's name as written. This is different
     from add_task/list_tasks — it's specifically about moving a task to someone else.
+"add_note": The user wants to attach/set a detailed note on a task, beyond its short
+    description (e.g. "add a note to the dentist task: bring my insurance card", "note on
+    task 2: park in the back lot"). Include a "note_text" field with just the note content
+    (not the task reference).
+"view_note": The user wants to see the note on a task (e.g. "what's the note on the dentist
+    task", "show me the details for task 2"). No extra field beyond task identification.
+"set_priority": The user wants to set or change a task's priority level (e.g. "make the
+    dentist task priority 1", "mark task 2 as urgent", "set the report to low priority").
+    Include a "priority" field: 1 for urgent/highest/"priority 1"/"asap", 2 for "priority
+    2"/medium, 3 for "priority 3"/low/"no rush".
 "unknown": Anything else.
 
-For complete_task, delete_task, and transfer_task: if the user refers to the task by its
-position in a list they were just shown, rather than by describing it, include a
-"list_position" field with that position as a plain integer (1-based). This covers things
-like "mark number 1 as done", "delete item 2", "complete task 3", "the first one", "send
-#2 to Sarah" -- convert words like "first"/"second"/"third" to 1/2/3, and strip any leading
-"#". Do NOT include "list_position" if the user described the task instead (e.g. "mark the
-dentist appointment as done") -- in that case omit the field entirely. If they said "all"
-or "everything" rather than a number or description, that's complete_all_tasks/clear_tasks
-instead, not a list_position.
+For complete_task, delete_task, transfer_task, add_note, view_note, and set_priority: if the
+user refers to the task by its position in a list they were just shown, rather than by
+describing it, include a "list_position" field with that position as a plain integer
+(1-based). This covers things like "mark number 1 as done", "delete item 2", "complete task
+3", "the first one", "send #2 to Sarah", "note on task 2: ..." -- convert words like
+"first"/"second"/"third" to 1/2/3, and strip any leading "#". Do NOT include "list_position"
+if the user described the task instead (e.g. "mark the dentist appointment as done") -- in
+that case omit the field entirely. If they said "all" or "everything" rather than a number
+or description, that's complete_all_tasks/clear_tasks instead, not a list_position.
 
 Return this schema:
 {
@@ -172,6 +197,21 @@ Response: {"intent": "transfer_task", "raw_message": "send the grocery run task 
 
 User: "send #3 to John"
 Response: {"intent": "transfer_task", "raw_message": "send #3 to John", "recipient_name": "John", "list_position": 3}
+
+User: "add a note to the dentist task: bring my insurance card"
+Response: {"intent": "add_note", "raw_message": "add a note to the dentist task: bring my insurance card", "note_text": "bring my insurance card"}
+
+User: "note on task 2: park in the back lot"
+Response: {"intent": "add_note", "raw_message": "note on task 2: park in the back lot", "list_position": 2, "note_text": "park in the back lot"}
+
+User: "what's the note on the dentist task"
+Response: {"intent": "view_note", "raw_message": "what's the note on the dentist task"}
+
+User: "make the dentist task priority 1"
+Response: {"intent": "set_priority", "raw_message": "make the dentist task priority 1", "priority": 1}
+
+User: "mark task 2 as urgent"
+Response: {"intent": "set_priority", "raw_message": "mark task 2 as urgent", "list_position": 2, "priority": 1}
 """
 
 def parse_intent(user_message: str)->dict:

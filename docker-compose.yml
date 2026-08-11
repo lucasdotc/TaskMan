@@ -17,7 +17,10 @@
 
 services:
   postgres:
-    image: postgres:16
+    # pgvector/pgvector is the official Postgres image with the pgvector
+    # extension precompiled in -- same Postgres 16 otherwise, just with
+    # `CREATE EXTENSION vector` (see schema.sql) actually available.
+    image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
