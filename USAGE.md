@@ -12,6 +12,7 @@ This guide covers everything it can do, in plain language. If you just want a qu
 - [Seeing your tasks](#seeing-your-tasks)
 - [Focusing on one category](#focusing-on-one-category)
 - [Marking a task done or deleting it](#marking-a-task-done-or-deleting-it)
+- [Editing a task](#editing-a-task)
 - [Handling several tasks at once](#handling-several-tasks-at-once)
 - [Adding extra details to a task](#adding-extra-details-to-a-task)
 - [Priority and overdue reminders](#priority-and-overdue-reminders)
@@ -73,12 +74,17 @@ Ask, and the bot lists everything you still have pending:
 
 Or use the command: `/list`
 
-Your tasks show up numbered and grouped by category, with their due dates. That number next to each task is important. You can use it to refer to that task in your very next message (see below), so you don't have to describe it in detail or type the whole thing out again.
+Your tasks show up numbered and grouped by category, with their due dates. That number next to each task is permanent -- it's that task's number for as long as it exists, not just for this one list. You can refer to it any time afterward, in any message, even much later and even if you've switched `/category` or other tasks have come and gone since: "mark number 7 as done", "edit task 3", `/done 7`. You never have to run `/list` again just to "refresh" a number.
 
 To see just one category, say so, or add it after the command:
 
 - "what work tasks do I have?"
 - `/list work`
+
+To see them sorted by urgency instead of due date:
+
+- "show me my tasks by priority"
+- `/list priority` (or `/list work priority` for just one category)
 
 ---
 
@@ -105,8 +111,7 @@ Type `/category` by itself any time to check what you're currently focused on.
 Just say it:
 
 - "mark the dentist appointment as done"
-- "delete the grocery task"
-- "mark number 2 as done" (using the number from your last `/list`)
+- "mark number 2 as done" (using the task's number)
 
 Or use the command, which accepts either the task's number or a description:
 
@@ -116,6 +121,41 @@ Or use the command, which accepts either the task's number or a description:
 ```
 
 If your description matches more than one task, the bot will show you buttons to pick the right one instead of guessing.
+
+Marking a task done is different from deleting it. "Done" keeps the task on record as completed; deleting removes it entirely, and can't be undone:
+
+- "delete the grocery task"
+- "remove task 5"
+
+Or use the command, same accepted inputs as `/done`:
+
+```
+/delete 2
+/delete dentist appointment
+```
+
+---
+
+## Editing a task
+
+You can change almost anything about a task after you've created it, just by asking:
+
+- "move task 3 to tomorrow at 5pm" (changes the due date/time)
+- "rename task 2 to 'buy birthday present'"
+- "change the dentist task to work" (changes its category)
+- "make task 4 recurring every week"
+
+Or, for description/category/priority/recurrence/notes (not due dates -- see below), the command:
+
+```
+/edit <number> description <new text>
+/edit <number> category <name>
+/edit <number> priority <1|2|3|none>
+/edit <number> recurrence <daily|weekly|weekdays|monthly|none>
+/edit <number> note <text>
+```
+
+Changing a due date needs the bot to actually understand what you mean by "tomorrow" or "next Friday," so `/edit` doesn't handle dates directly -- just ask naturally instead, as in the first example above.
 
 ---
 
@@ -256,9 +296,11 @@ Nearly everything below also works as a plain sentence. These are just the direc
 | Command | What it does |
 |---|---|
 | `/start` | Introduction and a short command list |
-| `/list [category]` | Show your pending tasks, optionally just one category |
+| `/list [category] [priority]` | Show your pending tasks, optionally filtered to a category and/or sorted by priority |
 | `/category <name>` | Focus on one category until you switch back with `/category all` |
 | `/done <number or description>` | Mark a task complete |
+| `/delete <number or description>` | Permanently remove a task (cannot be undone) |
+| `/edit <number> <field> <value>` | Change a task's description, category, priority, recurrence, or note (fields: `description`, `category`, `priority`, `recurrence`, `note`) |
 | `/completeall [category]` | Mark all (or one category's) tasks complete, with confirmation |
 | `/clear [category]` | Remove all (or one category's) tasks, with confirmation |
 | `/note <number> [text]` | Set a note on a task, or view it if you leave the text off |
@@ -278,7 +320,7 @@ If the bot didn't understand a message, try rephrasing it more directly. For exa
 
 If a voice message got misheard, the bot always echoes back what it heard before acting on it, so you'll see right away if something didn't come through right. Just send it again, or type it instead.
 
-If referring to a task by number stopped working, that number is tied to your most recent `/list`. If you haven't listed your tasks recently, or a task's position changed since then, run `/list` again first to refresh which number means what.
+If referring to a task by number doesn't do what you expect, double check you've got the right number with `/list` -- each task's number is permanent and never changes, so unlike before, you don't need to re-run `/list` just to "refresh" it.
 
 If you can't `/transfer` a task to someone, they need to have sent the bot at least one message already. Ask them to say hello to it first, then try again.
 

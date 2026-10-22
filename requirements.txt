@@ -3,9 +3,6 @@ anthropic==0.121.0
 openai==1.109.1
 APScheduler==3.10.4
 psycopg[binary]
-pgvector==0.5.0
-huggingface_hub==1.27.0
-numpy==2.2.6
 python-dotenv==1.0.1
 pytz==2024.1
 requests

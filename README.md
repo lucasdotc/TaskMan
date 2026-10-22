@@ -20,12 +20,17 @@ Telegram Servers
      ▼
 bot.py  (python-telegram-bot, one process, one event loop)
      │
-     ├── voice.py transcribes voice/audio messages first
-     ├── calls claude.py to detect intent
-     ├── calls claude.py to parse the task
-     ├── calls embeddings.py to embed the task description
-     ├── calls db.py to save task + reminders
-     ├── replies to you in Telegram
+     ├── a slash command (/list, /done, /edit, ...) is handled directly in
+     │   bot.py, straight against db.py -- fast, deterministic, no AI call
+     │
+     ├── free-text/voice (not a slash command) goes to agent.py instead:
+     │     ├── voice.py transcribes voice/audio messages first
+     │     ├── agent.py runs a Claude tool-use loop with tools backed
+     │     │   directly by db.py (list/add/edit/delete/complete a task, set
+     │     │   the active category, request bulk-action confirmation,
+     │     │   transfer a task) -- Claude decides which to call and in
+     │     │   what order, then writes the reply itself
+     │     └── replies to you in Telegram
      │
      └── two APScheduler jobs (started in post_init, see bot.py), both on
          a 60-second interval, independent of each other
@@ -41,14 +46,13 @@ bot.py  (python-telegram-bot, one process, one event loop)
 
 | Component | Role |
 |---|---|
-| `bot.py` | Receives messages from Telegram, routes them, replies, owns the reminder scheduler |
-| `claude.py` | Uses Claude API to understand natural language |
+| `bot.py` | Receives messages from Telegram, handles slash commands directly, routes free text/voice to the AI agent, owns the reminder scheduler |
+| `agent.py` | A Claude tool-use agent with direct, live access to the task database -- handles anything that isn't a slash command |
 | `voice.py` | Transcribes voice/audio messages to text via OpenAI Whisper |
-| `embeddings.py` | Embeds task descriptions via HuggingFace, for pgvector-based `/done` matching |
 | `reminders.py` | Generates and delivers both due-time reminders and overdue nudges |
 | `db.py` | All database reads and writes |
 | APScheduler | In-process interval timer running both reminder jobs every 60s (see `post_init` in `bot.py`) |
-| PostgreSQL + pgvector | Persists tasks, reminders, and users; pgvector adds similarity search on task embeddings |
+| PostgreSQL | Persists tasks, reminders, and users |
 | systemd | Keeps the process running and restarts it if it crashes |
 
 This used to run as two extra processes, a Celery worker and Celery Beat, coordinated through Redis, purely to check for due reminders every 60 seconds. APScheduler does the same job as one scheduled job living inside `bot.py` itself. See the Reminder scheduling section below for the tradeoffs of that change.
@@ -69,9 +73,9 @@ The entry point. This file sets up the Telegram bot, registers all the handlers,
 
 The tradeoff: polling holds an open connection and checks in on an interval rather than being pushed to instantly, so there's a small amount of extra latency (typically well under a second) and it does slightly more idle network chatter than a webhook would. At personal-bot scale neither matters.
 
-#### Intent detection
+#### Free text and voice: the AI agent
 
-Every plain text message goes through `handle_message`, which calls `parse_intent` in `claude.py` to figure out what the user wants to do. Based on the returned intent (`add_task`, `list_tasks`, `complete_task`, etc.) it routes to the right handler function. Users don't need to remember slash commands; they can just talk naturally.
+Every plain text message that isn't a slash command goes through `handle_message`, which hands it to `run_agent` in `agent.py`. The agent is a Claude tool-use loop with tools backed directly by `db.py` -- `list_tasks`, `get_task`, `add_task`, `edit_task`, `delete_task`, `complete_task`, `request_bulk_action`, `set_active_category`, `transfer_task` -- so Claude itself decides which to call, in what order, and what to say back, rather than a fixed Python branch per hand-coded intent. Users don't need to remember slash commands; they can just talk naturally, including multi-step or unusual phrasing ("add X and also mark 3 done", "move task 7 to tomorrow and bump its priority") that a fixed intent list would never have anticipated.
 
 #### Authorization
 
@@ -79,7 +83,7 @@ Every plain text message goes through `handle_message`, which calls `parse_inten
 
 #### Inline keyboards
 
-The `/done` flow uses Telegram inline keyboards (buttons attached to messages). When Claude fuzzy-matches a task, the bot sends a confirmation message with ✅ and ❌ buttons. The user taps one, Telegram fires a `callback_query`, and `done_callback` handles it. Each button carries a `data` string (the task UUID) so the handler knows which task to act on.
+The `/done` and `/delete` commands use Telegram inline keyboards (buttons attached to messages) whenever a typed description matches more than one pending task: the bot sends a message with one button per candidate plus Cancel, the user taps one, Telegram fires a `callback_query`, and `done_callback`/`delete_callback` handle it. Each button carries a `data` string (the task's internal UUID) so the handler knows which task to act on. Bulk actions (`/clear`, `/completeall`, and the AI agent's `request_bulk_action` tool) use the same mechanism for their Yes/Cancel confirmation.
 
 #### Voice messages
 
@@ -87,45 +91,43 @@ The `/done` flow uses Telegram inline keyboards (buttons attached to messages). 
 
 #### Categories
 
-Every task has a `category` (e.g. `personal`, `work`, `school`, or anything else you say). Claude infers it from the message when you add a task, either from an explicit statement like "add a work task to..." or from context clues, and defaults to `personal` if nothing suggests otherwise. `/list` with no arguments groups your tasks by category; `/list work` shows just one category. The same filtering works in natural language too ("what work tasks do I have"). `/list` no longer shows each task's UUID: with numbered output and `/category` scoping (below) covering normal use, a raw ID was just clutter. `/done` and `/transfer` still accept a UUID prefix under the hood for anyone who has one from elsewhere.
+Every task has a `category` (e.g. `personal`, `work`, `school`, or anything else you say). The AI agent infers it from the message when you add a task, either from an explicit statement like "add a work task to..." or from context clues, and defaults to `personal` if nothing suggests otherwise. `/list` with no arguments groups your tasks by category; `/list work` shows just one category; `/list priority` (optionally combined, e.g. `/list work priority`) sorts by urgency instead of due date. The same filtering and sorting works in natural language too ("what work tasks do I have", "show me everything by priority").
 
 #### `/category`, scoping commands like `cd`
 
-`/category work` sets a per-user "current category" (`CURRENT_CATEGORY`, an in-memory dict keyed by Telegram user ID, with the same non-persistence reasoning as `LAST_LISTED_TASK_IDS` below: it's a UX convenience tied to your ongoing conversation, not data worth surviving a restart). Once set, `/list`, `/done`, delete, `/transfer`, and `/clear` all default to that category instead of everything, and new tasks you add default into it too, the same way `cd`ing into a directory makes new files land there. Giving any of those commands an explicit category still overrides the ambient one for that one call without changing it, the same way `ls <path>` doesn't change your shell's cwd. `/category` alone shows what you're scoped to; `/category all` (or "none", "clear", "reset") goes back to seeing everything.
+`/category work` sets a per-user "current category" (`CURRENT_CATEGORY`, an in-memory dict keyed by Telegram user ID -- a UX convenience tied to your ongoing conversation, not data worth surviving a restart). Once set, `/list`, `/done`, `/delete`, `/edit`, `/transfer`, and `/clear` all default to that category instead of everything, and new tasks you add default into it too, the same way `cd`ing into a directory makes new files land there. Giving any of those commands an explicit category still overrides the ambient one for that one call without changing it, the same way `ls <path>` doesn't change your shell's cwd. `/category` alone shows what you're scoped to; `/category all` (or "none", "clear", "reset") goes back to seeing everything. The AI agent can change this too, via its `set_active_category` tool ("let's focus on work", "show me everything again").
 
-New tasks are the one place this isn't a soft default. While scoped to a category, `add_task` uses it unconditionally rather than letting Claude's own content-based guess override it (`get_current_category(...) or parsed.get("category", "personal")`). Having Claude decide whether ambient context or message content should win per task turned out to be too unpredictable, so the ambient category wins outright instead. That mirrors real `cd` semantics: if you want a task filed elsewhere while scoped in, you switch first (`/category personal`), the same way you'd `cd` elsewhere before creating a file there.
+New tasks are the one place this isn't a soft default: while scoped to a category, the agent's `add_task` tool uses it unconditionally rather than letting Claude's own content-based guess override it. That mirrors real `cd` semantics: if you want a task filed elsewhere while scoped in, you switch first (`/category personal`), the same way you'd `cd` elsewhere before creating a file there.
 
-#### Referring to a task by its list number
+#### Referring to a task by its permanent number
 
-`/list` numbers every task it shows, continuously across category groups rather than restarting at 1 per group (restarting would make two different tasks both display as "1." in the same message, which is ambiguous). `list_tasks` records that exact ordering in `LAST_LISTED_TASK_IDS`, an in-memory dict keyed by Telegram user ID, right before it sends the message.
+Every task gets a permanent `task_number` (a plain incrementing integer, see `schema.sql`) the moment it's created, and keeps it forever -- it's never reused or renumbered, even after the task is completed or deleted. `/list` always shows this number next to each task, and it's what you refer back to afterward: "mark number 7 as done", "edit task 3", `/done 7`, `/edit 3 priority 1`.
 
-That's what lets you say "mark number 1 as done", "delete item 2", or "send #3 to Sarah" instead of describing the task or copy-pasting a UUID. `parse_intent` returns a `list_position` field when it detects this pattern, and `resolve_list_position` looks it up against what that user was last shown, skipping the vector search and the `fuzzy_match` Claude call entirely. If the task at that position was completed, deleted, or transferred away since the list was shown, the lookup against the current pending tasks simply comes up empty and the bot says so; it never acts on stale data. `/done <number>` and `/transfer <number> <recipient>` support the same shorthand for consistency with the natural-language flow. This state is deliberately in-memory only, not the database, since it's tied to one specific message the bot already sent, not data worth surviving a restart.
+This is deliberately *not* a recomputed position in your last `/list` (an earlier design here had that bug: a task's apparent position shifts every time something else is completed, added, or filtered out, so acting on a stale position could silently hit the wrong task, or nothing at all, especially if you'd changed `/category` scope in between). A `task_number` means the same row every time, so `get_task_by_number(number, telegram_user_id)` in `db.py` can resolve it directly -- scoped to the caller's own tasks, so a guessed or hallucinated number can never return someone else's task -- with no need to `/list` first and no risk of category-scope mismatches.
 
-#### Referring to a task by description: vector search first, Claude as fallback
+#### Referring to a task by description
 
-When you don't give a number, `resolve_task_by_description` in `bot.py` is what turns "mark the dentist one as done" into an actual task. It tries two things in order.
+If you don't give a number, both the slash commands (`/done`, `/delete`, `/transfer`) and the AI agent can match a task by description instead. The commands do a simple case-insensitive substring match against your pending tasks (`_find_task_for_command` in `bot.py`); if more than one task matches, you get a button to pick the right one. The AI agent is more flexible: it calls its `list_tasks` tool, reads the descriptions itself, and picks the best match (or asks you to clarify if it genuinely can't tell), so phrasing like "the dentist one" or "that thing due Friday" works without an exact substring.
 
-First, a pgvector similarity search, which is fast and needs no LLM call: `embed_text` in `embeddings.py` turns your message into a 384-dimension vector via HuggingFace's hosted Inference API (`sentence-transformers/all-MiniLM-L6-v2`), and `find_similar_task` in `db.py` asks Postgres for the pending task whose stored embedding (computed the same way, at creation time, from the task's `description`) is closest to it, using pgvector's `<=>` cosine-distance operator. If the closest match's distance is under `VECTOR_MATCH_THRESHOLD` (0.5, a starting guess; see the TODO about tuning it once there's real usage to judge against), that task is used directly.
+#### Notes and priority (`/note`, `/priority`, `/edit`)
 
-Second, `fuzzy_match`, the original Claude-based approach, is used as a fallback whenever the vector search isn't confident enough, or embeddings aren't available at all: no `HUGGINGFACE_API_TOKEN` configured, the API call failed, or the task predates this feature and was never embedded. A pure vector search only knows topical similarity and has no way to reason about something like "the one due today," so a query the vector search can't confidently resolve gets a second chance from an LLM that can actually read the full task list and the phrasing, rather than being rejected outright.
+`/note <number> [text]` sets a free-text note (`tasks.notes`) beyond the short description, or shows the current one if you omit the text. The slash command only accepts a number, not a free-text task description, since there's no reliable way to tell where a typed description ends and the note text begins (e.g. `/note dentist appointment remember insurance card`). A free-text reference only works through natural language, where the AI agent does that splitting for you.
 
-This is deliberately vector-first with an LLM fallback, rather than a full replacement of `fuzzy_match`. It's cheaper and faster for the common case, without losing the LLM's ability to handle trickier phrasing. Every call site that used to call `fuzzy_match` directly (`process_task`, `handle_transfer`, `transfer_command`) now goes through `resolve_task_by_description` instead.
+`/priority <number> <1|2|3>` sets `tasks.priority`, which controls how often overdue nudges repeat (see Overdue nudges in the `reminders.py` section below). Priority is only ever set when a message explicitly signals urgency ("priority 1", "urgent", "no rush") -- the agent's system prompt (see `agent.py`) is explicit that this must never be guessed from a task's subject matter, unlike category.
 
-#### Notes and priority (`/note`, `/priority`)
+`/edit <number> <field> <value>` (field: `description`, `category`, `priority`, `recurrence`, or `note`) is a deterministic shortcut for changing one of those fields without going through the AI agent. Changing a due date needs real date parsing, so that's agent-only -- just ask naturally ("move task 3 to tomorrow at 5pm") and it resolves the date and calls its `edit_task` tool, which also re-schedules that task's reminders around the new due time.
 
-Two small, related features, both following the same pattern as everything above: a slash command plus a natural-language equivalent (`add_note`/`view_note`/`set_priority` intents), both resolving the target task the same way (`_resolve_task_for`, by list position or by `resolve_task_by_description`).
+#### Deleting a task (`/delete`)
 
-`/note <number> [text]` sets a free-text note (`tasks.notes`) beyond the short description, or shows the current one if you omit the text. The slash command only accepts a number, not a free-text task description, since there's no reliable way to tell where a typed description ends and the note text begins (e.g. `/note dentist appointment remember insurance card`). A free-text reference only works through natural language, where Claude does that splitting for you as structured JSON.
-
-`/priority <number> <1|2|3>` sets `tasks.priority`, which controls how often overdue nudges repeat (see Overdue nudges in the `reminders.py` section below). `parse_task` only ever sets a priority when the message explicitly signals urgency ("priority 1", "urgent", "no rush"). Unlike category, it's never guessed from the task's subject matter, since guessing wrong on urgency felt like exactly the kind of thing that should require you to actually say it.
+`/delete <number or description>` permanently removes a task -- and, via a foreign-key cascade, any of its still-pending reminders -- unlike `/done`, which just marks it complete. This can't be undone, so use it when you want a task gone entirely rather than finished. The AI agent has the same distinction built into its system prompt: "done"/"finished" calls `complete_task`, "delete"/"remove"/"get rid of" calls `delete_task`.
 
 #### Bulk actions: "mark all as done" / "remove all"
 
-`complete_all_tasks` (new) and `clear_tasks` are effectively the same operation under the hood, `mark_all_tasks_complete` in `db.py`, which soft-completes every pending task for a user (optionally scoped to one category) and silences their unset reminders, with no hard deletes. `handle_complete_all` and `handle_clear` in `bot.py` are thin, near-identical wrappers around it that just differ in wording ("Marked N complete" vs "Cleared N") and confirm-button `callback_data` prefix. Both show a Yes/Cancel confirmation first, for the same reason the original single-category `/clear` always had one: it's bulk, and there's no undo command. Both also fall back to your `/category` context when no explicit category is given, same as everything else above.
+`handle_complete_all` and `handle_clear` in `bot.py` both wrap `mark_all_tasks_complete` in `db.py`, which soft-completes every pending task for a user (optionally scoped to one category) and silences their unsent reminders -- no hard deletes, unlike single-task `/delete`. Both show a Yes/Cancel confirmation first, since it's bulk and there's no undo. `/clear` and `/completeall` trigger these directly; in natural language, the AI agent calls its `request_bulk_action` tool instead of looping single-task tools itself, which shows the exact same confirmation button before anything happens.
 
 #### Task transfer (admin only)
 
-Admins (Telegram IDs listed in `ADMIN_USER_ID`) can hand a task off to another user, either by typing `/transfer <task id, description, or list number> <name or telegram id>` or just saying something like "send the grocery task to Sarah" or "send #2 to Sarah." Transferring a task changes its `telegram_user_id` in the database. Since reminders are linked to the task, not the user, and always look up the current owner when they fire, an already-scheduled reminder will just go to the new owner automatically. The recipient needs to be in `ALLOWED_USER_ID` (so they're allowed to use the bot at all) and needs to have messaged the bot at least once already, since Telegram doesn't let a bot DM someone who hasn't started a chat with it first.
+Admins (Telegram IDs listed in `ADMIN_USER_ID`) can hand a task off to another user, either by typing `/transfer <task number or description> <name or telegram id>` or just saying something like "send task 2 to Sarah." Transferring a task changes its `telegram_user_id` in the database. Since reminders are linked to the task, not the user, and always look up the current owner when they fire, an already-scheduled reminder will just go to the new owner automatically. The recipient needs to be in `ALLOWED_USER_ID` (so they're allowed to use the bot at all) and needs to have messaged the bot at least once already, since Telegram doesn't let a bot DM someone who hasn't started a chat with it first. The AI agent's `transfer_task` tool re-checks admin status itself server-side before doing anything -- it never trusts the model's own judgment about who's allowed to transfer.
 
 Non-admin users can run `/register <name>` to set a friendly display name, so admins can `/transfer` to them by name instead of hunting down their raw Telegram ID. `/whoami` shows your own ID, name, and role. `/users` (admin only) lists everyone registered, with name, admin status, and Telegram ID, so an admin can see who's available to send a task to without already knowing their name or ID.
 
@@ -139,23 +141,21 @@ The tradeoff of moving this in-process: reminder delivery now shares the bot's s
 
 ---
 
-### `claude.py`
+### `agent.py`
 
-All Claude API interactions live here. There are three main functions.
+The AI agent: a Claude tool-use loop with direct, live access to the task database, used for every free-text or transcribed-from-voice message that isn't a slash command. This replaced the old `claude.py` pipeline (`parse_intent` classifying text into a fixed set of intents, `parse_task` extracting structured fields, `fuzzy_match` picking a task by description), where Claude only ever produced JSON that hand-written Python then acted on.
 
-#### `parse_intent(user_message)`
+#### `run_agent(...)`
 
-Sends the user's message to Claude with a prompt that asks it to classify the intent and return JSON. Claude returns one of: `add_task`, `list_tasks`, `complete_task`, `delete_task`, `clear_tasks`, `complete_all_tasks`, `transfer_task`, `add_note`, `view_note`, `set_priority`, or `unknown`. `list_tasks`, `clear_tasks`, and `complete_all_tasks` may all return a `category` field if you scoped the request to one; `transfer_task` returns a `recipient_name`; `add_note` returns a `note_text`; `set_priority` returns a `priority` (1/2/3); `complete_task`/`delete_task`/`transfer_task`/`add_note`/`view_note`/`set_priority` may return a `list_position` (converting words like "first"/"second" to 1/2) when you referred to the task by its position in your last `/list` instead of describing it. `complete_all_tasks` is distinct from `complete_task` specifically so "mark all as done" and "mark the dentist one as done" route to different handlers instead of one intent trying to mean both. This is what makes the bot feel conversational rather than command-driven.
+Takes the user's message plus some context (their Telegram ID, whether they're an admin, their active `/category` focus, and the configured timezone) and three callbacks (`on_confirm_needed`, `on_transfer`, `on_set_category`) that let tool execution reach back into `bot.py` for the few things that need Telegram itself (showing a confirm button, DMing a transfer recipient, updating the in-memory category context). It builds a system prompt with the current time/timezone/category/role baked in, then loops: call Claude with the `TOOLS` list, execute whatever tool calls come back, feed the results back in, and repeat (capped at `MAX_AGENT_STEPS`) until Claude responds with plain text instead of a tool call, which is what gets sent back to the user.
 
-#### `parse_task(user_message, timezone)`
+#### Tools
 
-Takes a natural language task description and asks Claude to extract structured data from it: the task description, due date/time in UTC, recurrence rule, reminder offsets, category, and priority. Claude returns JSON which gets parsed and saved to the database. Priority is only ever set from an explicit signal ("priority 1", "urgent", "no rush") and stays `null` otherwise; see the Notes and priority section under `bot.py` above for why that's treated differently from category, which Claude is allowed to guess from context.
+Each tool is a plain Python function (or, for the two that need Telegram, an async one) closed over the current request's `telegram_user_id` and `is_admin` -- never over anything from the model's own tool-call arguments. That's what keeps this safe to expose: `list_tasks`/`get_task`/`add_task`/`edit_task`/`delete_task`/`complete_task` all resolve a `task_number` through `db.get_task_by_number(number, telegram_user_id)`, so even a hallucinated or deliberately-crafted number can only ever touch a task actually owned by whoever is chatting. `transfer_task` goes further and re-checks the `is_admin` flag itself before doing anything, rather than trusting the system prompt to stop a non-admin from asking for one. `request_bulk_action` never touches the database directly -- it calls back into `bot.py`'s existing `handle_clear`/`handle_complete_all`, which show the same Yes/Cancel confirmation button the slash commands use, so a destructive bulk request always gets the same explicit confirmation regardless of how it was asked for.
 
-The system prompts use `{{` and `}}` to escape literal JSON braces. Python's `.format()` method interprets `{}` as template variables, so any JSON examples in the prompt need doubled braces to be treated as literal characters.
+#### Dates, priority, and category
 
-#### `fuzzy_match(user_message, tasks)`
-
-Used by the complete/delete/transfer flows. Sends the user's message alongside their full task list and asks Claude to return the UUID of the task that best matches. This lets users say "mark the dentist one as done" instead of copy-pasting a UUID.
+The system prompt tells Claude to convert whatever the user said ("tomorrow", "Friday at 5pm", "in an hour") into an ISO 8601 UTC `due_datetime` itself, using the current UTC time and the user's timezone, both given in the prompt -- there's no separate date-parsing step. Priority is explicitly never to be inferred from a task's subject matter, only from an explicit signal ("urgent", "priority 1", "no rush"); category is the opposite, meant to be guessed from context when nothing else says otherwise, unless the user is already scoped into one via `/category`.
 
 ---
 
@@ -169,35 +169,26 @@ If you'd rather not depend on OpenAI, whether for cost reasons or because you wa
 
 ---
 
-### `embeddings.py`
-
-Turns text into a semantic embedding vector, for the pgvector-based task matching described under Referring to a task by description above.
-
-`embed_text` calls HuggingFace's hosted Inference API (`InferenceClient.feature_extraction`) using `sentence-transformers/all-MiniLM-L6-v2`, a small, well-established sentence-embedding model that outputs 384-dimension vectors (hence `vector(384)` in `schema.sql`). This was chosen over an OpenAI embeddings model specifically to avoid adding a third paid API vendor alongside Anthropic and OpenAI. HuggingFace's Inference API has a free tier, and this bot's embedding volume, one call per task added and one per match attempt, is tiny.
-
-Two things worth knowing. It returns `None` on any failure (no `HUGGINGFACE_API_TOKEN` configured, a network error, a HuggingFace outage) rather than raising. Every caller treats a missing embedding the same as "no confident vector match" and falls back to `fuzzy_match`, so a HuggingFace problem degrades this one feature rather than breaking task matching entirely. It also handles two possible response shapes: `feature_extraction` normally returns one pooled vector per input, but depending on the model or endpoint it can come back as one vector per token instead. `embed_text` mean-pools across tokens in that case so callers always get a single flat vector either way. This was written without a live HuggingFace token to test against, so it's worth double-checking the actual response shape once real usage exists.
-
----
-
 ### `db.py`
 
 All database operations. Uses `psycopg` (the modern PostgreSQL driver, since `psycopg2` doesn't support Python 3.14) to connect to PostgreSQL.
 
 #### Connection pattern
 
-Every function opens a connection, does its work, and closes it in a `finally` block so the connection is always released even if an error occurs. This is intentionally simple; a connection pool would be more efficient at scale but adds complexity that isn't needed for a personal bot. `get_connection` also calls `pgvector.psycopg.register_vector` on every new connection, which teaches psycopg how to convert a Python list of floats to and from Postgres's `vector` type automatically. Without it, `save_task`'s `embedding` param and `find_similar_task`'s results would need manual vector-literal formatting instead of just passing and receiving plain lists.
+Every function opens a connection, does its work, and closes it in a `finally` block so the connection is always released even if an error occurs. This is intentionally simple; a connection pool would be more efficient at scale but adds complexity that isn't needed for a personal bot.
 
 #### Key functions
 
-- `save_task` inserts a new task (with its category, priority, and embedding) and returns its UUID
-- `save_reminder` inserts a reminder row linked to a task, with a `scheduled_for` timestamp
+- `save_task` inserts a new task (with its category and priority) and returns its UUID plus its permanent `task_number`
+- `save_reminder` inserts a reminder row linked to a task, with a `scheduled_for` timestamp; `delete_unsent_reminders` removes a task's not-yet-fired reminders, used when its due date is edited so stale ones don't also fire
 - `get_due_reminders` returns all reminders where `scheduled_for <= NOW()` and `sent = FALSE` and the parent task isn't complete, including a 30-second buffer to catch reminders that are about to fire
 - `mark_reminder_sent` sets `sent = TRUE` on a reminder so it doesn't fire again
-- `get_pending_tasks` returns incomplete tasks for a user, optionally filtered to one category
-- `find_similar_task` runs pgvector's `<=>` cosine-distance search for the pending task closest in meaning to a given embedding; see Referring to a task by description under `bot.py`
+- `get_pending_tasks` returns incomplete tasks for a user, optionally filtered to one category, sorted by due date (default) or by priority
+- `get_task_by_id` and `get_task_by_number` look up a single task by its internal UUID or its permanent user-facing number -- both can be scoped to an owning `telegram_user_id` so a guessed/leaked id can't act on someone else's task
+- `update_task` changes only the fields passed to it (a field passed as `None` clears it, a field left out entirely is untouched) -- backs `/edit`, `/note`, `/priority`, and the AI agent's `edit_task` tool
+- `delete_task` permanently removes a task row (and, via cascade, its reminders) -- the one place a task is actually erased, rather than just soft-completed
 - `mark_task_complete` sets `is_complete = TRUE` on a task
 - `mark_all_tasks_complete` is the bulk version: it sets `is_complete = TRUE` on every pending task for a user (optionally scoped to a category) and silences their unset reminders. It backs both `/clear` ("remove all") and "mark all as done," since they're the same operation, just worded differently at the call site
-- `set_task_notes` and `set_task_priority` back `/note` and `/priority`
 - `get_overdue_tasks_needing_reminder` and `mark_overdue_reminder_sent` back the overdue-nudge job; see Overdue nudges under `reminders.py` below
 - `transfer_task` reassigns a task's `telegram_user_id` to a new owner and records who assigned it
 - `ensure_user`, `set_display_name`, `get_user`, `find_user_by_name`, and `get_all_users` manage the `users` table backing task transfer and `/users` (display names, admin flags)
@@ -246,7 +237,8 @@ psql "$DATABASE_URL" -f schema.sql
 ### `tasks`
 | Column | Type | Description |
 |---|---|---|
-| `id` | UUID | Primary key, auto-generated |
+| `id` | UUID | Primary key, auto-generated, internal only |
+| `task_number` | BIGINT | Permanent, user-facing task number (unique, never reused); this is what `/list` shows and every command/tool accepts |
 | `telegram_user_id` | BIGINT | Telegram user ID of the current owner |
 | `description` | TEXT | What the task is |
 | `due_datetime` | TIMESTAMPTZ | When it's due (UTC) |
@@ -256,7 +248,7 @@ psql "$DATABASE_URL" -f schema.sql
 | `notes` | TEXT | Free-text detail beyond `description`, set/viewed via `/note`; null until set |
 | `priority` | SMALLINT | 1/2/3 or null; controls overdue-nudge frequency, see `reminders.py`'s Overdue nudges |
 | `last_overdue_reminder_at` | TIMESTAMPTZ | When this task last got an overdue nudge; null means never nudged yet |
-| `embedding` | vector(384) | Sentence embedding of `description`, for pgvector similarity search; null if never computed (no HuggingFace token, or predates this feature) |
+| `embedding` | vector(384) | Leftover from an earlier description-matching approach; no longer written or read by any code (see `agent.py`) -- left in place rather than migrated away, since dropping a column is a destructive change nothing requires |
 | `is_complete` | BOOLEAN | Whether the task is done |
 | `created_at` | TIMESTAMPTZ | When it was created |
 
@@ -311,11 +303,10 @@ This only works against a directory that's an actual `git clone` (it needs `.git
 
 - Python 3.14
 - python-telegram-bot for polling and the Telegram API
-- Anthropic Claude API for intent detection, task parsing, and reminder message generation
-- PostgreSQL + pgvector for persistent storage, plus similarity search on task embeddings for `/done` matching
+- Anthropic Claude API, via tool use, as a direct-database-access AI agent (`agent.py`) for every free-text/voice request, plus reminder message generation (`reminders.py`)
+- PostgreSQL for persistent storage
 - psycopg as the PostgreSQL driver, since psycopg2 doesn't support Python 3.14
 - OpenAI Whisper API for voice message transcription, since Claude doesn't accept audio input
-- HuggingFace Inference API for task-description embeddings (`sentence-transformers/all-MiniLM-L6-v2`), for vector-based task matching
 - APScheduler for in-process reminder scheduling (runs every 60s inside the bot process, no broker needed)
 - AWS EC2 for hosting (not required, see Deployment)
 - systemd for process supervision

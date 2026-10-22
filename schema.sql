@@ -75,6 +75,22 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS last_overdue_reminder_at TIMESTAMPTZ;
 -- rows.
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS embedding vector(384);
 
+-- A permanent, user-facing task number -- assigned once when the task is
+-- created and never reused or changed, even after the task is completed or
+-- deleted. This is what bot.py and the AI agent (see agent.py) show and
+-- accept everywhere instead of the internal UUID: "task 7" always means the
+-- same row, in every /list, regardless of category scoping or how many
+-- other tasks have come and gone since. A plain BIGINT + sequence (rather
+-- than BIGSERIAL) so this block stays safe to re-run against an existing
+-- database, same as everything else in this file.
+CREATE SEQUENCE IF NOT EXISTS tasks_task_number_seq;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS task_number BIGINT;
+ALTER TABLE tasks ALTER COLUMN task_number SET DEFAULT nextval('tasks_task_number_seq');
+UPDATE tasks SET task_number = nextval('tasks_task_number_seq') WHERE task_number IS NULL;
+ALTER TABLE tasks ALTER COLUMN task_number SET NOT NULL;
+ALTER SEQUENCE tasks_task_number_seq OWNED BY tasks.task_number;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_task_number ON tasks (task_number);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_user_pending
     ON tasks (telegram_user_id, is_complete);
 

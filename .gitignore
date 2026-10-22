@@ -3,3 +3,6 @@ taskmainpair.pem
 TODO.md
 taskmanpair.pem
 details.md
+__pycache__/
+*.pyc
+venv/

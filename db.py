@@ -1,34 +1,28 @@
 import psycopg
 from psycopg.rows import dict_row
-from pgvector.psycopg import register_vector
 import os
 from dotenv import load_dotenv
 load_dotenv()
 
 def get_connection():
-    conn = psycopg.connect(os.getenv("DATABASE_URL"))
-    # Teaches this connection how to convert a Python list <-> Postgres's
-    # `vector` type automatically, so callers can just pass/receive plain
-    # lists of floats (see save_task's embedding param and
-    # find_similar_task below) without manually formatting vector literals.
-    register_vector(conn)
-    return conn
+    return psycopg.connect(os.getenv("DATABASE_URL"))
 
-def save_task(telegram_user_id: int, description: str, due_datetime, recurrence_rule: str = None, category: str = "personal", priority: int = None, embedding: list = None) -> str:
+def save_task(telegram_user_id: int, description: str, due_datetime, recurrence_rule: str = None, category: str = "personal", priority: int = None) -> dict:
+    """Inserts a new task and returns its id and permanent task_number."""
     conn = get_connection()
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
-                INSERT INTO tasks (telegram_user_id, description, due_datetime, recurrence_rule, category, priority, embedding)
-                VALUES(%s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
+                INSERT INTO tasks (telegram_user_id, description, due_datetime, recurrence_rule, category, priority)
+                VALUES(%s, %s, %s, %s, %s, %s)
+                RETURNING id, task_number
                 """,
-                (telegram_user_id, description, due_datetime, recurrence_rule, category, priority, embedding)
+                (telegram_user_id, description, due_datetime, recurrence_rule, category, priority)
             )
-            task_id = cur.fetchone()[0]
+            row = cur.fetchone()
             conn.commit()
-            return str(task_id)
+            return {"id": str(row["id"]), "task_number": row["task_number"]}
     finally:
         conn.close()
 
@@ -42,6 +36,21 @@ def save_reminder(task_id: str, scheduled_for) -> None:
                 VALUES (%s, %s)
                 """,
                 (task_id, scheduled_for)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+def delete_unsent_reminders(task_id: str) -> None:
+    """Drops any not-yet-fired reminders for a task -- used when a task's
+    due date is edited, so stale reminders from the old due date don't
+    still fire alongside the newly-scheduled ones."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM reminders WHERE task_id = %s AND sent = FALSE",
+                (task_id,)
             )
         conn.commit()
     finally:
@@ -132,107 +141,144 @@ def mark_overdue_reminder_sent(task_id: str) -> None:
     finally:
         conn.close()
 
-def get_pending_tasks(telegram_user_id: int, category: str = None):
+def get_pending_tasks(telegram_user_id: int, category: str = None, sort: str = "due") -> list[dict]:
     """
-    Returns pending tasks for a user. If `category` is given, only tasks in
-    that category are returned. Otherwise all pending tasks come back
-    ordered by category first (so callers can group them for display) then
-    by due date.
+    Returns pending tasks for a user, optionally scoped to one category.
+
+    sort="due" (the default) orders by category then due date, so callers
+    with no explicit category can group the results for display. sort=
+    "priority" orders by priority instead (1 = most urgent first, unset
+    tasks last), then due date, ignoring category grouping -- used by
+    "/list priority" and whenever the AI agent is asked to sort by urgency.
     """
+    order_clause = (
+        "priority ASC NULLS LAST, due_datetime ASC NULLS LAST" if sort == "priority"
+        else "category ASC, due_datetime ASC NULLS LAST"
+    )
+
     conn = get_connection()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
+            query = f"""
+                SELECT id, task_number, description, due_datetime, recurrence_rule,
+                       category, assigned_by, priority, notes
+                FROM tasks
+                WHERE telegram_user_id = %s
+                    AND is_complete = FALSE
+                    {{category_clause}}
+                ORDER BY {order_clause}
+            """
             if category:
-                cur.execute(
-                    """SELECT id, description, due_datetime, category, assigned_by, priority, notes
-                    FROM tasks
-                    WHERE telegram_user_id = %s
-                        AND is_complete = FALSE
-                        AND category = %s
-                    ORDER BY due_datetime ASC NULLS LAST
-                    """,
-                    (telegram_user_id, category)
-                )
+                cur.execute(query.format(category_clause="AND category = %s"), (telegram_user_id, category))
             else:
-                cur.execute(
-                    """SELECT id, description, due_datetime, category, assigned_by, priority, notes
-                    FROM tasks
-                    WHERE telegram_user_id = %s
-                        AND is_complete = FALSE
-                    ORDER BY category ASC, due_datetime ASC NULLS LAST
-                    """,
-                    (telegram_user_id,)
-                )
+                cur.execute(query.format(category_clause=""), (telegram_user_id,))
             return cur.fetchall()
     finally:
         conn.close()
 
-def find_similar_task(telegram_user_id: int, embedding: list, category: str = None) -> dict | None:
-    """
-    Uses pgvector's <=> operator (cosine distance) to find the single
-    pending task whose stored embedding is closest to the given one --
-    entirely inside Postgres, no Python-side comparison needed.
+def get_task_by_id(task_id: str, telegram_user_id: int = None) -> dict | None:
+    """Looks up one task by its internal UUID, optionally restricted to a
+    given owner (pass telegram_user_id whenever the caller shouldn't be
+    able to act on someone else's task just by guessing/leaking a UUID)."""
+    conn = get_connection()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            if telegram_user_id is not None:
+                cur.execute(
+                    """SELECT id, task_number, description, due_datetime, recurrence_rule,
+                              category, assigned_by, priority, notes, telegram_user_id, is_complete
+                       FROM tasks WHERE id = %s AND telegram_user_id = %s""",
+                    (task_id, telegram_user_id)
+                )
+            else:
+                cur.execute(
+                    """SELECT id, task_number, description, due_datetime, recurrence_rule,
+                              category, assigned_by, priority, notes, telegram_user_id, is_complete
+                       FROM tasks WHERE id = %s""",
+                    (task_id,)
+                )
+            return cur.fetchone()
+    finally:
+        conn.close()
 
-    Returns the task plus its `distance` (0.0 = identical meaning, ~1.0 =
-    unrelated, up to 2.0 = opposite) so the caller can decide whether it's
-    confident enough to act on, or should fall back to fuzzy_match instead
-    -- see resolve_task_by_description() in bot.py. Returns None if the
-    user has no pending tasks with an embedding at all (e.g. HuggingFace
-    was down when they were all created).
+def get_task_by_number(task_number: int, telegram_user_id: int) -> dict | None:
+    """
+    Looks up a task by its permanent, user-facing number, scoped to the
+    caller's own tasks -- so a guessed or hallucinated number can never
+    return someone else's task. This is the primary way both the bot's
+    slash commands and the AI agent (see agent.py) resolve "task 7" to an
+    actual row: it works regardless of category scoping, /list history, or
+    whether the task is still pending.
     """
     conn = get_connection()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
-            # category_clause is one of two fixed strings, never user
-            # input -- same safe-to-interpolate reasoning as elsewhere in
-            # this file (e.g. mark_all_tasks_complete above).
-            category_clause = "AND category = %s" if category else ""
-            params = [embedding, telegram_user_id] + ([category] if category else [])
-
-            # The explicit ::vector cast matters: unlike an INSERT (where
-            # Postgres can infer the parameter's type from the target
-            # column), a bare %s here would parse as a generic array type
-            # and the <=> operator has no overload for vector <=> array --
-            # confirmed by actually hitting that error while testing this.
             cur.execute(
-                f"""
-                SELECT id, description, due_datetime, category, assigned_by, priority, notes,
-                       embedding <=> %s::vector AS distance
-                FROM tasks
-                WHERE telegram_user_id = %s
-                    AND is_complete = FALSE
-                    AND embedding IS NOT NULL
-                    {category_clause}
-                ORDER BY distance
-                LIMIT 1
-                """,
-                params
+                """SELECT id, task_number, description, due_datetime, recurrence_rule,
+                          category, assigned_by, priority, notes, telegram_user_id, is_complete
+                   FROM tasks WHERE task_number = %s AND telegram_user_id = %s""",
+                (task_number, telegram_user_id)
             )
             return cur.fetchone()
     finally:
         conn.close()
 
-def set_task_notes(task_id: str, notes: str) -> None:
+_UPDATABLE_TASK_FIELDS = {"description", "due_datetime", "recurrence_rule", "category", "priority", "notes"}
+
+def update_task(task_id: str, **fields) -> dict | None:
+    """
+    Updates only the columns passed in `fields`. A column left out of
+    `fields` entirely is untouched; a column passed with value None clears
+    it (e.g. update_task(id, due_datetime=None) removes a task's due date).
+    Only names in _UPDATABLE_TASK_FIELDS are ever accepted, so this can't be
+    used to overwrite telegram_user_id, is_complete, etc. Returns the
+    updated row, or the current row unchanged if `fields` had nothing
+    applicable.
+    """
+    columns = [k for k in fields if k in _UPDATABLE_TASK_FIELDS]
+    if not columns:
+        return get_task_by_id(task_id)
+
+    # set_clause is built only from the fixed whitelist above, never from
+    # caller-supplied strings, so interpolating the column names here is
+    # safe -- the actual values are still passed as %s parameters.
+    set_clause = ", ".join(f"{col} = %s" for col in columns)
+    values = [fields[col] for col in columns]
+
     conn = get_connection()
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "UPDATE tasks SET notes = %s WHERE id = %s",
-                (notes, task_id)
+                f"""UPDATE tasks SET {set_clause} WHERE id = %s
+                    RETURNING id, task_number, description, due_datetime, recurrence_rule,
+                              category, priority, notes""",
+                values + [task_id]
             )
+            updated = cur.fetchone()
         conn.commit()
+        return updated
     finally:
         conn.close()
 
-def set_task_priority(task_id: str, priority: int) -> None:
+def delete_task(task_id: str) -> dict | None:
+    """
+    Permanently removes a task, and -- via the reminders.task_id foreign
+    key's ON DELETE CASCADE -- any of its reminders along with it. Unlike
+    mark_task_complete/mark_all_tasks_complete, which only ever soft-
+    complete a task, this is the one place a task row is actually erased.
+    Returns the deleted row's id/task_number/description, or None if
+    task_id didn't match anything.
+    """
     conn = get_connection()
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "UPDATE tasks SET priority = %s WHERE id = %s",
-                (priority, task_id)
+                "DELETE FROM tasks WHERE id = %s RETURNING id, task_number, description",
+                (task_id,)
             )
+            deleted = cur.fetchone()
         conn.commit()
+        return deleted
     finally:
         conn.close()
 
@@ -304,7 +350,7 @@ def transfer_task(task_id: str, new_owner_id: int, assigned_by: int) -> dict | N
                 UPDATE tasks
                 SET telegram_user_id = %s, assigned_by = %s
                 WHERE id = %s
-                RETURNING id, description, due_datetime, category
+                RETURNING id, task_number, description, due_datetime, category
                 """,
                 (new_owner_id, assigned_by, task_id)
             )

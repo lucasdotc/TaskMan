@@ -4,9 +4,9 @@ Speech-to-text for Telegram voice messages.
 Telegram voice notes arrive as OGG/Opus audio, and Claude's Messages API
 doesn't accept audio input -- it's text (and image) only. So this module
 sends the raw audio bytes to OpenAI's Whisper transcription endpoint and
-hands back plain text. That text is then fed into the exact same
-parse_intent()/parse_task() pipeline in claude.py that a typed message goes
-through, so voice messages get identical handling to text ones once
+hands back plain text. That text is then fed into the exact same AI agent
+(agent.py) that a typed message goes through, via process_text_message() in
+bot.py, so voice messages get identical handling to text ones once
 transcribed.
 
 Requires OPENAI_API_KEY in .env (separate from ANTHROPIC_API_KEY -- this is

@@ -1,6 +1,5 @@
 import os
 import logging
-from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -14,14 +13,14 @@ from telegram.ext import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from claude import parse_task, parse_intent, fuzzy_match
+from agent import run_agent
 from db import (
-    save_task, save_reminder, get_pending_tasks, mark_task_complete, mark_all_tasks_complete,
+    get_pending_tasks, mark_task_complete, mark_all_tasks_complete,
     ensure_user, set_display_name, get_user, find_user_by_name, transfer_task,
-    sync_admins_from_env, get_all_users, find_similar_task, set_task_notes, set_task_priority,
+    sync_admins_from_env, get_all_users, get_task_by_id, get_task_by_number,
+    update_task, delete_task,
 )
 from voice import transcribe_audio
-from embeddings import embed_text
 from reminders import check_and_send_reminders, check_overdue_tasks
 
 load_dotenv()
@@ -55,78 +54,55 @@ def is_authorized(update: Update) -> bool:
 def is_admin(update: Update) -> bool:
     return update.effective_user.id in ADMIN_USER_IDS
 
-# Remembers, per Telegram user, the ordered task IDs from their most recent
-# /list -- so "mark number 1 as done" can be resolved to a task without
-# asking Claude to guess from the description. Deliberately in-memory only
-# (not in the DB): it's display state tied to one specific message the bot
-# already sent, not data worth persisting across a restart. Since the bot is
-# a single process now (see the APScheduler swap), a plain module-level dict
-# is enough -- there's no second process that would need to share this.
-LAST_LISTED_TASK_IDS: dict[int, list[str]] = {}
-
-def remember_shown_tasks(user_id: int, tasks: list) -> None:
-    LAST_LISTED_TASK_IDS[user_id] = [str(t["id"]) for t in tasks]
-
-def resolve_list_position(user_id: int, position: int) -> str | None:
-    """Maps a 1-based position from the user's last /list to a task UUID.
-    Returns None if there's no remembered list, or the position is out of
-    range -- callers treat that the same as "no match found", so a stale or
-    made-up number fails safely instead of acting on the wrong task."""
-    ids = LAST_LISTED_TASK_IDS.get(user_id)
-    if not ids or position < 1 or position > len(ids):
-        return None
-    return ids[position - 1]
-
 # Per-user "current category" context, set with /category -- works like a
-# shell `cd`. Once set, /list, /done, delete, transfer, and /clear all
-# default to that category instead of everything, and new tasks default
-# into it too (see add_task). An explicit category given to any of those
-# commands still overrides it for that one call, same as `ls <path>`
-# doesn't change your shell's cwd. Same in-memory, single-process reasoning
-# as LAST_LISTED_TASK_IDS above -- UX convenience, not data worth
-# persisting across a restart.
+# shell `cd`. Once set, /list, /done, /delete, /edit, /transfer, and /clear
+# all default to that category instead of everything, and new tasks default
+# into it too (see the AI agent's add_task tool). An explicit category given
+# to any of those commands still overrides it for that one call, same as
+# `ls <path>` doesn't change your shell's cwd. Deliberately in-memory only
+# (not the database): it's UX convenience tied to the ongoing conversation,
+# not data worth surviving a restart.
 CURRENT_CATEGORY: dict[int, str] = {}
 
 def get_current_category(user_id: int) -> str | None:
     return CURRENT_CATEGORY.get(user_id)
+
+def set_current_category(user_id: int, category: str | None) -> None:
+    if category:
+        CURRENT_CATEGORY[user_id] = category
+    else:
+        CURRENT_CATEGORY.pop(user_id, None)
 
 def get_scoped_tasks(user_id: int, category: str = None) -> list:
     """Fetches pending tasks, falling back to the user's /category context
     when no explicit category is given."""
     return get_pending_tasks(user_id, category=category or get_current_category(user_id))
 
-# pgvector cosine distance below which a vector match is trusted without
-# asking Claude to double check. 0.0 = identical meaning, ~1.0 = unrelated,
-# up to 2.0 = opposite. This is a starting point, not a measured value --
-# there was no live HuggingFace token available while building this, so
-# it's worth watching how well matches land in practice and adjusting.
-VECTOR_MATCH_THRESHOLD = 0.5
-
-async def resolve_task_by_description(user_id: int, message: str, category: str = None) -> dict | None:
+def _find_task_for_command(user_id: int, query: str):
     """
-    Finds the task that best matches a free-text description. Tries
-    pgvector similarity search first (fast, cheap, no LLM call) and only
-    falls back to asking Claude (fuzzy_match) if that either isn't
-    available (no HuggingFace token, or the API call failed) or isn't
-    confident enough (distance >= VECTOR_MATCH_THRESHOLD).
+    Resolves a slash-command argument to a task, for commands that accept
+    either a number or a description (/done, /delete, /transfer). A bare
+    number is looked up by its permanent task_number directly -- it always
+    resolves, regardless of category scoping or anything previously listed.
+    Otherwise it's matched as a case-insensitive substring against pending
+    task descriptions, scoped to the active /category if one is set.
 
-    This is the "vector-first, LLM fallback" design specifically: a pure
-    vector search is fast and cheap but can't reason about anything beyond
-    topical similarity (it wouldn't know "the one due today" from "the one
-    due next month" if the wording is otherwise similar) -- so a query that
-    isn't a confident vector match gets a second chance from an LLM that
-    actually understands the full task list and the phrasing, rather than
-    just being rejected outright.
+    Returns a single task dict, a list of 2+ candidate tasks (caller should
+    let the user disambiguate), or None for no match at all.
     """
-    embedding = embed_text(message)
-    if embedding is not None:
-        match = find_similar_task(user_id, embedding, category=category)
-        if match and match["distance"] < VECTOR_MATCH_THRESHOLD:
-            return match
+    query = query.strip()
+    if query.isdigit():
+        task = get_task_by_number(int(query), user_id)
+        return task if task and not task["is_complete"] else None
 
-    tasks = get_scoped_tasks(user_id, category)
-    task_id = await fuzzy_match(message, tasks)
-    return next((t for t in tasks if str(t["id"]) == task_id), None) if task_id else None
+    tasks = get_scoped_tasks(user_id)
+    query_lower = query.lower()
+    matches = [t for t in tasks if query_lower in t["description"].lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        return matches
+    return None
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -173,137 +149,74 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE, user_message: str):
     """
     The shared pipeline for both typed and transcribed-from-voice messages:
-    classify intent, then route to the matching handler.
+    hands the message to the AI agent (agent.py), which has direct tool
+    access to the task database and decides for itself what to do, then
+    sends back whatever it replies with.
     """
     logger.info(f"Received message: {user_message}")
-    ensure_user(update.effective_user.id, update.effective_user.first_name)
+    user_id = update.effective_user.id
+    ensure_user(user_id, update.effective_user.first_name)
 
     await update.message.reply_text("Working...")
 
-    try:
-        intent_result = parse_intent(user_message)
-        intent = intent_result["intent"]
-
-        if intent == "add_task":
-            await add_task(update, user_message)
-        elif intent == "list_tasks":
-            await list_tasks(update, context, category=intent_result.get("category"))
-        elif intent == "complete_task":
-            await process_task(update, user_message, "complete", intent_result.get("list_position"))
-        elif intent == "delete_task":
-            await process_task(update, user_message, "delete", intent_result.get("list_position"))
-        elif intent == "clear_tasks":
-            await handle_clear(update, context, intent_result.get("category"))
-        elif intent == "complete_all_tasks":
-            await handle_complete_all(update, context, intent_result.get("category"))
-        elif intent == "transfer_task":
-            await handle_transfer(
-                update, context, user_message,
-                intent_result.get("recipient_name"), intent_result.get("list_position")
-            )
-        elif intent == "add_note":
-            await handle_note(
-                update, context,
-                position=intent_result.get("list_position"), description=user_message,
-                note_text=intent_result.get("note_text")
-            )
-        elif intent == "view_note":
-            await handle_note(update, context, position=intent_result.get("list_position"), description=user_message)
-        elif intent == "set_priority":
-            await handle_priority(
-                update, context,
-                position=intent_result.get("list_position"), description=user_message,
-                priority=intent_result.get("priority")
-            )
+    async def _on_confirm_needed(action: str, category: str | None):
+        if action == "clear":
+            await handle_clear(update, context, category)
         else:
-            await update.message.reply_text(
-                "I'm not sure what you mean. Try something like:\n"
-                "• 'Remind me to call mom tomorrow at 3pm'\n"
-                "• 'What tasks do I have?'\n"
-                "• 'Mark the dentist one as done'"
-            )
+            await handle_complete_all(update, context, category)
 
+    async def _on_transfer(task: dict, recipient_name: str):
+        recipient = find_user_by_name(recipient_name)
+        if not recipient:
+            return {"error": f'No registered user matches "{recipient_name}". They need to message the bot and run /register first.'}
+        await do_transfer(update, context, str(task["id"]), recipient["telegram_user_id"], recipient.get("display_name"))
+        return {"transferred": {"task_number": task["task_number"], "to": recipient.get("display_name") or recipient["telegram_user_id"]}}
+
+    def _on_set_category(category: str | None):
+        set_current_category(user_id, category)
+
+    try:
+        reply = await run_agent(
+            user_message=user_message,
+            telegram_user_id=user_id,
+            is_admin=is_admin(update),
+            category_context=get_current_category(user_id),
+            timezone=USER_TIMEZONE,
+            on_confirm_needed=_on_confirm_needed,
+            on_transfer=_on_transfer,
+            on_set_category=_on_set_category,
+        )
+        if reply:
+            await update.message.reply_text(reply, parse_mode="Markdown")
     except Exception as e:
         import traceback
-        logger.error(f"Error handling msg: {e}\n{traceback.format_exc()}")
+        logger.error(f"Error running agent: {e}\n{traceback.format_exc()}")
         await update.message.reply_text(
-            "Sorry, something went wrong parsing that. Try rephrasing with a clear time, like 'remind me to call mom tomorrow at 3pm'."
+            "Sorry, something went wrong handling that. Try rephrasing, or use a command like /list or /done."
         )
 
-async def add_task(update: Update, user_message: str):
-    parsed = parse_task(user_message, timezone=USER_TIMEZONE)
-    logger.info(f"Parsed task: {parsed}")
-
-    description = parsed["description"]
-    due_datetime = parsed.get("due_datetime")
-    recurrence_rule = parsed.get("recurrence_rule")
-    offsets = parsed.get("reminder_offsets_minutes", [0])
-    priority = parsed.get("priority")
-    # While "cd'd" into a category via /category, new tasks go there
-    # unconditionally -- like creating a file while cd'd into a directory,
-    # it lands there regardless of its name. Claude's own inference from
-    # the message is only used when there's no active /category context.
-    category = get_current_category(update.effective_user.id) or parsed.get("category", "personal")
-
-    # Embedding the description (not the whole raw message) so later
-    # matches compare "task description" to "task description" -- see
-    # resolve_task_by_description, which embeds whatever the user typed
-    # when trying to find this task again. embed_text returns None if
-    # HuggingFace is unreachable/unconfigured; save_task accepts that fine,
-    # this task just won't be vector-matchable until a future backfill.
-    embedding = embed_text(description)
-
-    task_id = save_task(
-        telegram_user_id=update.effective_user.id,
-        description=description,
-        due_datetime=due_datetime,
-        recurrence_rule=recurrence_rule,
-        category=category,
-        priority=priority,
-        embedding=embedding
-    )
-
-    priority_note = f" [priority {priority}]" if priority else ""
-
-    if due_datetime:
-        local_tz = pytz.timezone(USER_TIMEZONE)
-        local_due = due_datetime.astimezone(local_tz)
-        due_str = local_due.strftime("%A, %b %d at %I:%M %p")
-
-        for offset_minutes in offsets:
-            reminder_time = due_datetime - timedelta(minutes=offset_minutes)
-
-            if reminder_time > datetime.now(pytz.utc):
-                save_reminder(task_id, reminder_time)
-
-        reply = f"Saved to *{category}*{priority_note}. I will remind you to *{description}* on {due_str}."
-    else:
-        reply = f"Saved to *{category}*{priority_note}: *{description}* (no due date set - use /list to see all tasks)"
-
-    await update.message.reply_text(reply, parse_mode="Markdown")
-
-def _format_task_line(i: int, task: dict, local_tz) -> str:
+def _format_task_line(task: dict, local_tz, show_category: bool = False) -> str:
     priority_tag = f" [P{task['priority']}]" if task.get("priority") else ""
     due_str = ""
     if task["due_datetime"]:
         local_due = task["due_datetime"].astimezone(local_tz)
         due_str = f" -- due {local_due.strftime('%b %d at %I:%M %p')}"
     assigned_note = " (assigned to you)" if task.get("assigned_by") else ""
-    # No task ID shown here on purpose -- with /list numbering and /category
-    # scoping, referring to a task by its number ("mark number 1 as done")
-    # or description covers normal use, and a raw UUID just clutters the
-    # display. /done and /transfer still accept a UUID prefix under the
-    # hood if you ever have one from elsewhere (e.g. the database).
-    return f"{i}. {task['description']}{priority_tag}{due_str}{assigned_note}"
+    category_tag = f" [{task['category']}]" if show_category else ""
+    # The leading number is the task's permanent task_number, not a
+    # recomputed list position -- it's the same number in every /list and
+    # never changes, so it's always safe to refer back to later (e.g.
+    # "/done 7", "/edit 7 priority 1") without listing first.
+    return f"{task['task_number']}. {task['description']}{category_tag}{priority_tag}{due_str}{assigned_note}"
 
-async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE, category: str = None):
+async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE, category: str = None, sort: str = "due"):
     if not is_authorized(update):
         return
 
     # An explicit category always wins for this one call; otherwise fall
     # back to whatever the user is "cd'd" into via /category.
     category = category or get_current_category(update.effective_user.id)
-    tasks = get_pending_tasks(update.effective_user.id, category=category)
+    tasks = get_pending_tasks(update.effective_user.id, category=category, sort=sort)
 
     if not tasks:
         msg = f"No pending tasks in *{category}*." if category else "No pending tasks."
@@ -311,44 +224,42 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE, categor
         return
 
     local_tz = pytz.timezone(USER_TIMEZONE)
+    by_priority = sort == "priority"
 
     if category:
-        lines = [f"*Your pending {category} tasks:*\n"]
-        lines += [_format_task_line(i, t, local_tz) for i, t in enumerate(tasks, 1)]
+        header = f"*Your pending {category} tasks" + (" (by priority):*" if by_priority else ":*")
+        lines = [header] + [_format_task_line(t, local_tz) for t in tasks]
+    elif by_priority:
+        lines = ["*Your pending tasks, by priority:*"]
+        lines += [_format_task_line(t, local_tz, show_category=True) for t in tasks]
     else:
-        # get_pending_tasks() orders by category, so grouping by insertion
-        # order here reproduces that grouping without a second sort.
+        # get_pending_tasks() orders by category when sort="due", so
+        # grouping by insertion order here reproduces that grouping without
+        # a second sort.
         grouped: dict[str, list] = {}
         for t in tasks:
             grouped.setdefault(t["category"], []).append(t)
 
-        # Numbering runs continuously across every category (1, 2, 3, ...)
-        # instead of restarting at 1 in each group -- restarting would mean
-        # two different tasks both showing as "1." in the same message,
-        # which makes "mark number 1 as done" ambiguous.
         lines = ["*Your pending tasks:*"]
-        counter = 1
         for cat, cat_tasks in grouped.items():
             lines.append(f"\n_{cat.capitalize()}_")
-            for t in cat_tasks:
-                lines.append(_format_task_line(counter, t, local_tz))
-                counter += 1
-
-    # tasks is already in the same order the numbers above were assigned in
-    # (get_pending_tasks orders by category, and grouping above preserves
-    # that order), so this is what "number N" will resolve against next.
-    remember_shown_tasks(update.effective_user.id, tasks)
+            lines += [_format_task_line(t, local_tz) for t in cat_tasks]
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/list with no args shows everything grouped by category;
-    /list work shows just the work category."""
-    category = context.args[0].lower() if context.args else None
-    await list_tasks(update, context, category=category)
+    """/list with no args shows everything grouped by category, ordered by
+    due date; /list work shows just the work category; /list priority sorts
+    by priority instead (most urgent first); the two can combine, e.g.
+    /list work priority."""
+    args = [a.lower() for a in context.args]
+    sort = "priority" if "priority" in args else "due"
+    category_args = [a for a in args if a != "priority"]
+    category = category_args[0] if category_args else None
+    await list_tasks(update, context, category=category, sort=sort)
 
 async def category_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Works like `cd`: /category work scopes /list, /done, delete,
+    """Works like `cd`: /category work scopes /list, /done, /delete, /edit,
     /transfer, and /clear to the "work" category by default until you
     switch or reset it, and new tasks default into it too. /category alone
     shows what you're currently scoped to; /category all resets to
@@ -371,41 +282,15 @@ async def category_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     name = context.args[0].lower()
     if name in ("all", "none", "clear", "reset"):
-        CURRENT_CATEGORY.pop(update.effective_user.id, None)
+        set_current_category(update.effective_user.id, None)
         await update.message.reply_text("Back to viewing everything.")
         return
 
-    CURRENT_CATEGORY[update.effective_user.id] = name
+    set_current_category(update.effective_user.id, name)
     await update.message.reply_text(
         f"Now viewing *{name}*. /list, /done, /transfer, /clear, and new tasks will default here until you /category all.",
         parse_mode="Markdown"
     )
-
-async def process_task(update: Update, user_message: str, cmd: str, list_position: int = None):
-    if list_position is not None:
-        # Referring to a task by its position from the last /list -- no
-        # need for vector search or Claude, just look up what was shown.
-        tasks = get_scoped_tasks(update.effective_user.id)
-        task_id = resolve_list_position(update.effective_user.id, list_position)
-        task = next((t for t in tasks if str(t["id"]) == task_id), None) if task_id else None
-    else:
-        task = await resolve_task_by_description(
-            update.effective_user.id, user_message, get_current_category(update.effective_user.id)
-        )
-
-    if not task:
-        message = (
-            "I don't have a task at that position -- run /list first, then refer to a number from it."
-            if list_position is not None else
-            "I could not find a task with that description. Use /list to see all of your active tasks."
-        )
-        await update.message.reply_text(message)
-        return
-    mark_task_complete(str(task["id"]))
-    if cmd == "complete":
-        await update.message.reply_text(f"Marked complete: *{task['description']}*", parse_mode="Markdown")
-    elif cmd == "delete":
-        await update.message.reply_text(f"Deleted: *{task['description']}*", parse_mode="Markdown")
 
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -413,75 +298,39 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not context.args:
         await update.message.reply_text(
-            "Usage: /done <number, description, or task id>\nRun /list to see task numbers"
+            "Usage: /done <task number or description>\nRun /list to see task numbers"
         )
         return
 
     input_text = " ".join(context.args)
-    tasks = get_scoped_tasks(update.effective_user.id)
+    result = _find_task_for_command(update.effective_user.id, input_text)
 
-    # A bare number is treated as "position from my last /list" rather than
-    # a UUID prefix -- with numbered /list output now available, that's what
-    # a plain "1" or "2" almost always means.
-    if input_text.isdigit():
-        task_id = resolve_list_position(update.effective_user.id, int(input_text))
-        task = next((t for t in tasks if str(t["id"]) == task_id), None) if task_id else None
-        if task:
-            mark_task_complete(str(task["id"]))
-            await update.message.reply_text(f"Marked complete: *{task['description']}*", parse_mode="Markdown")
-        else:
-            await update.message.reply_text("I don't have a task at that position -- run /list first, then use a number from it.")
+    if result is None:
+        await update.message.reply_text(f'No pending task matching "{input_text}". Use /list to see your tasks.')
         return
 
-    matched_by_id = [t for t in tasks if str(t["id"]).startswith(input_text)]
-    if len(matched_by_id) == 1:
-        task = matched_by_id[0]
-        mark_task_complete(str(task["id"]))
-        await update.message.reply_text(f"Marked complete: *{task['description']}*", parse_mode="Markdown")
-        return
-
-    input_lower = input_text.lower()
-    matched_by_desc = [t for t in tasks if input_lower in t["description"].lower()]
-
-    if len(matched_by_desc) == 1:
-        task = matched_by_desc[0]
-        mark_task_complete(str(task["id"]))
-        await update.message.reply_text(f"Marked complete: *{task['description']}*", parse_mode="Markdown")
-        return
-
-    if len(matched_by_desc) > 1:
+    if isinstance(result, list):
         local_tz = pytz.timezone(USER_TIMEZONE)
         keyboard = []
-        for task in matched_by_desc:
+        for task in result:
             due_str = ""
             if task["due_datetime"]:
                 local_due = task["due_datetime"].astimezone(local_tz)
                 due_str = f" (due {local_due.strftime('%b %d at %I:%M %p')})"
             keyboard.append([InlineKeyboardButton(
-                f"{task['description']}{due_str}",
+                f"#{task['task_number']}: {task['description']}{due_str}",
                 callback_data=f"done_{task['id']}"
             )])
         keyboard.append([InlineKeyboardButton("Cancel", callback_data="done_cancel")])
         await update.message.reply_text(
-            f"Multiple tasks match \"{input_text}\". Which one?",
+            f'Multiple tasks match "{input_text}". Which one?',
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
 
-    if not tasks:
-        await update.message.reply_text("No pending tasks found.")
-        return
-
-    local_tz = pytz.timezone(USER_TIMEZONE)
-    lines = [f"No task matching \"{input_text}\". Here are your pending tasks:\n"]
-    for i, task in enumerate(tasks, 1):
-        due_str = ""
-        if task["due_datetime"]:
-            local_due = task["due_datetime"].astimezone(local_tz)
-            due_str = f" -- due {local_due.strftime('%b %d at %I:%M %p')}"
-        lines.append(f"{i}. {task['description']}{due_str}")
-    await update.message.reply_text("\n".join(lines))
-
+    task = result
+    mark_task_complete(str(task["id"]))
+    await update.message.reply_text(f"Marked complete: *#{task['task_number']} {task['description']}*", parse_mode="Markdown")
 
 async def done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -492,110 +341,171 @@ async def done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     task_id = query.data.removeprefix("done_")
-    tasks = get_pending_tasks(query.from_user.id)
-    task = next((t for t in tasks if str(t["id"]) == task_id), None)
+    task = get_task_by_id(task_id, query.from_user.id)
 
-    if not task:
+    if not task or task["is_complete"]:
         await query.edit_message_text("Task not found or already completed.")
         return
 
     mark_task_complete(task_id)
-    await query.edit_message_text(f"Marked complete: *{task['description']}*", parse_mode="Markdown")
+    await query.edit_message_text(f"Marked complete: *#{task['task_number']} {task['description']}*", parse_mode="Markdown")
 
-
-# ---------------------------------------------------------------------------
-# Notes and priority
-# ---------------------------------------------------------------------------
-
-async def _resolve_task_for(update: Update, position: int = None, description: str = None) -> dict | None:
-    """
-    Shared task lookup for handle_note/handle_priority: by list position if
-    given, otherwise by description (vector-first, Claude fallback) -- the
-    exact same two paths process_task and handle_transfer use, just
-    factored out here since both /note and /priority need the identical
-    logic and neither has anything else going on around it.
-    """
-    if position is not None:
-        tasks = get_scoped_tasks(update.effective_user.id)
-        task_id = resolve_list_position(update.effective_user.id, position)
-        return next((t for t in tasks if str(t["id"]) == task_id), None) if task_id else None
-    return await resolve_task_by_description(
-        update.effective_user.id, description, get_current_category(update.effective_user.id)
-    )
-
-async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE, position: int = None, description: str = None, note_text: str = None):
-    """Shared by /note and the natural-language add_note/view_note flow.
-    Sets the note if note_text is given, otherwise shows the current one."""
+async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/delete permanently removes a task -- unlike /done, this cannot be
+    undone and the task isn't just marked complete, it's gone."""
     if not is_authorized(update):
         return
 
-    task = await _resolve_task_for(update, position, description)
-    if not task:
-        await update.message.reply_text("I don't have a task at that position -- run /list first, then use a number from it.")
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /delete <task number or description>\n"
+            "This permanently removes the task -- for finishing one instead, use /done."
+        )
         return
 
-    if note_text:
-        set_task_notes(str(task["id"]), note_text)
-        await update.message.reply_text(f"Note saved for *{task['description']}*.", parse_mode="Markdown")
-    else:
-        note = task.get("notes")
-        if note:
-            await update.message.reply_text(f"*{task['description']}*:\n{note}", parse_mode="Markdown")
-        else:
-            await update.message.reply_text(f"No note set for *{task['description']}* yet.", parse_mode="Markdown")
+    input_text = " ".join(context.args)
+    result = _find_task_for_command(update.effective_user.id, input_text)
+
+    if result is None:
+        await update.message.reply_text(f'No pending task matching "{input_text}". Use /list to see your tasks.')
+        return
+
+    if isinstance(result, list):
+        keyboard = [
+            [InlineKeyboardButton(f"#{t['task_number']}: {t['description']}", callback_data=f"delete_{t['id']}")]
+            for t in result
+        ]
+        keyboard.append([InlineKeyboardButton("Cancel", callback_data="delete_cancel")])
+        await update.message.reply_text(
+            f'Multiple tasks match "{input_text}". Which one should I delete?',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    deleted = delete_task(str(result["id"]))
+    await update.message.reply_text(f"Deleted: *#{deleted['task_number']} {deleted['description']}*", parse_mode="Markdown")
+
+async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "delete_cancel":
+        await query.edit_message_text("Cancelled.")
+        return
+
+    task_id = query.data.removeprefix("delete_")
+    task = get_task_by_id(task_id, query.from_user.id)
+    if not task:
+        await query.edit_message_text("Task not found.")
+        return
+
+    deleted = delete_task(task_id)
+    await query.edit_message_text(f"Deleted: *#{deleted['task_number']} {deleted['description']}*", parse_mode="Markdown")
+
+_EDIT_FIELDS = ("description", "category", "priority", "recurrence", "note")
+
+async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /edit <task number> <field> <value> -- field is one of description,
+    category, priority, recurrence, or note. Changing a due date needs real
+    date parsing, which this deterministic command doesn't do -- for that,
+    just ask naturally instead (e.g. "move task 3 to tomorrow at 5pm"), and
+    the AI agent will handle it.
+    """
+    if not is_authorized(update):
+        return
+
+    if len(context.args) < 2 or not context.args[0].isdigit() or context.args[1].lower() not in _EDIT_FIELDS:
+        await update.message.reply_text(
+            "Usage: /edit <task number> <field> <value>\n"
+            f"Fields: {', '.join(_EDIT_FIELDS)}\n"
+            'For a due date, just ask naturally instead, e.g. "move task 3 to tomorrow at 5pm".'
+        )
+        return
+
+    task = get_task_by_number(int(context.args[0]), update.effective_user.id)
+    if not task:
+        await update.message.reply_text("No task with that number. Use /list to see your tasks.")
+        return
+
+    field = context.args[1].lower()
+    value = " ".join(context.args[2:])
+
+    if field == "description":
+        if not value:
+            await update.message.reply_text("Usage: /edit <task number> description <new text>")
+            return
+        update_task(str(task["id"]), description=value)
+    elif field == "category":
+        if not value:
+            await update.message.reply_text("Usage: /edit <task number> category <name>")
+            return
+        update_task(str(task["id"]), category=value.lower())
+    elif field == "priority":
+        if value.lower() not in ("1", "2", "3", "none"):
+            await update.message.reply_text("Usage: /edit <task number> priority <1|2|3|none>")
+            return
+        update_task(str(task["id"]), priority=None if value.lower() == "none" else int(value))
+    elif field == "recurrence":
+        if value.lower() not in ("daily", "weekly", "weekdays", "monthly", "none"):
+            await update.message.reply_text("Usage: /edit <task number> recurrence <daily|weekly|weekdays|monthly|none>")
+            return
+        update_task(str(task["id"]), recurrence_rule=None if value.lower() == "none" else value.lower())
+    elif field == "note":
+        update_task(str(task["id"]), notes=value or None)
+
+    await update.message.reply_text(f"Updated *#{task['task_number']} {task['description']}*.", parse_mode="Markdown")
 
 async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /note <list number> [text] -- only a list number is accepted here, not
-    a free-text description, since there's no reliable way to tell where a
-    typed task description ends and the note text begins (e.g. "/note
-    dentist appointment remember insurance card" -- which words are the
-    task, which are the note?). For a free-text description, use natural
-    language instead ("add a note to the dentist task: ..."), where Claude
-    does that splitting for you as structured JSON rather than us guessing.
-    """
+    """/note <task number> [text] -- only a task number is accepted here,
+    not a free-text description, since there's no reliable way to tell
+    where a typed task description ends and the note text begins. For a
+    free-text description, just ask naturally instead (e.g. "add a note to
+    the dentist task: bring my insurance card")."""
     if not is_authorized(update):
         return
     if not context.args or not context.args[0].isdigit():
         await update.message.reply_text(
-            "Usage: /note <list number> [text to set -- omit to view the current note]\n"
+            "Usage: /note <task number> [text to set -- omit to view the current note]\n"
             "For a free-text description instead of a number, just ask naturally, "
-            "e.g. \"add a note to the dentist task: bring my insurance card\"."
+            'e.g. "add a note to the dentist task: bring my insurance card".'
         )
         return
 
-    position = int(context.args[0])
-    note_text = " ".join(context.args[1:]) if len(context.args) > 1 else None
-    await handle_note(update, context, position=position, note_text=note_text)
-
-async def handle_priority(update: Update, context: ContextTypes.DEFAULT_TYPE, position: int = None, description: str = None, priority: int = None):
-    """Shared by /priority and the natural-language set_priority flow."""
-    if not is_authorized(update):
-        return
-    if priority not in (1, 2, 3):
-        await update.message.reply_text("Priority must be 1, 2, or 3.")
-        return
-
-    task = await _resolve_task_for(update, position, description)
+    task = get_task_by_number(int(context.args[0]), update.effective_user.id)
     if not task:
-        await update.message.reply_text("I don't have a task at that position -- run /list first, then use a number from it.")
+        await update.message.reply_text("No task with that number. Use /list to see your tasks.")
         return
 
-    set_task_priority(str(task["id"]), priority)
-    await update.message.reply_text(f"Set *{task['description']}* to priority {priority}.", parse_mode="Markdown")
+    note_text = " ".join(context.args[1:]) if len(context.args) > 1 else None
+    if note_text:
+        update_task(str(task["id"]), notes=note_text)
+        await update.message.reply_text(f"Note saved for *#{task['task_number']} {task['description']}*.", parse_mode="Markdown")
+    else:
+        note = task.get("notes")
+        if note:
+            await update.message.reply_text(f"*#{task['task_number']} {task['description']}*:\n{note}", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"No note set for *#{task['task_number']} {task['description']}* yet.", parse_mode="Markdown")
 
 async def priority_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/priority <list number> <1|2|3> -- same number-only reasoning as /note above."""
+    """/priority <task number> <1|2|3> -- same number-only reasoning as /note above."""
     if not is_authorized(update):
         return
     if len(context.args) < 2 or not context.args[0].isdigit() or context.args[1] not in ("1", "2", "3"):
-        await update.message.reply_text("Usage: /priority <list number> <1|2|3>")
+        await update.message.reply_text("Usage: /priority <task number> <1|2|3>")
         return
-    await handle_priority(update, context, position=int(context.args[0]), priority=int(context.args[1]))
 
+    task = get_task_by_number(int(context.args[0]), update.effective_user.id)
+    if not task:
+        await update.message.reply_text("No task with that number. Use /list to see your tasks.")
+        return
+
+    update_task(str(task["id"]), priority=int(context.args[1]))
+    await update.message.reply_text(f"Set *#{task['task_number']} {task['description']}* to priority {context.args[1]}.", parse_mode="Markdown")
 
 async def handle_clear(update: Update, context: ContextTypes.DEFAULT_TYPE, category: str = None):
-    """Shared by /clear and the natural-language "remove all" flow. Shows a
+    """Shared by /clear and the AI agent's request_bulk_action tool. Shows a
     confirm/cancel button before acting, since this is bulk and there's no
     "un-clear" -- same reasoning as the single-task /clear always had."""
     if not is_authorized(update):
@@ -627,7 +537,6 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     category = context.args[0].lower() if context.args else None
     await handle_clear(update, context, category)
 
-
 async def clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -640,11 +549,10 @@ async def clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await query.edit_message_text("Clear cancelled.")
 
-
 async def handle_complete_all(update: Update, context: ContextTypes.DEFAULT_TYPE, category: str = None):
-    """Shared by /completeall and the natural-language "mark all as done"
-    flow. Same confirm/cancel pattern as handle_clear, for the same reason
-    -- there's no bulk "un-complete" either."""
+    """Shared by /completeall and the AI agent's request_bulk_action tool.
+    Same confirm/cancel pattern as handle_clear, for the same reason --
+    there's no bulk "un-complete" either."""
     if not is_authorized(update):
         return
 
@@ -669,7 +577,6 @@ async def complete_all_command(update: Update, context: ContextTypes.DEFAULT_TYP
     category = context.args[0].lower() if context.args else None
     await handle_complete_all(update, context, category)
 
-
 async def complete_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -688,15 +595,15 @@ async def complete_all_callback(update: Update, context: ContextTypes.DEFAULT_TY
 # ---------------------------------------------------------------------------
 
 async def do_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: str, recipient_id: int, recipient_label: str):
-    """Shared by both the natural-language transfer flow and /transfer:
-    moves the task in the DB, confirms to the sender, and DMs the recipient."""
+    """Shared by both the AI agent's transfer_task tool and /transfer: moves
+    the task in the DB, confirms to the sender, and DMs the recipient."""
     updated = transfer_task(task_id, recipient_id, assigned_by=update.effective_user.id)
     if not updated:
         await update.message.reply_text("That task no longer exists.")
         return
 
     await update.message.reply_text(
-        f"Sent *{updated['description']}* to {recipient_label or recipient_id}.",
+        f"Sent *#{updated['task_number']} {updated['description']}* to {recipient_label or recipient_id}.",
         parse_mode="Markdown"
     )
 
@@ -715,55 +622,14 @@ async def do_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE, task_i
         # with them, regardless of what's in ALLOWED_USER_ID.
         await context.bot.send_message(
             chat_id=recipient_id,
-            text=f"\U0001F4CB {sender_label} sent you a task: *{updated['description']}*{due_str}",
+            text=f"\U0001F4CB {sender_label} sent you a task: *#{updated['task_number']} {updated['description']}*{due_str}",
             parse_mode="Markdown"
         )
     except Exception:
         logger.warning(f"Could not notify recipient {recipient_id} of transferred task -- they may not have started a chat with the bot yet")
 
-async def handle_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE, user_message: str, recipient_name: str, list_position: int = None):
-    """Natural-language path: 'send the grocery task to Sarah' or 'send #2 to Sarah'."""
-    if not is_admin(update):
-        await update.message.reply_text("Only admins can transfer tasks to other users.")
-        return
-
-    if not recipient_name:
-        await update.message.reply_text(
-            "I couldn't tell who to send that to. Try being explicit, e.g. "
-            "\"send the grocery task to Sarah\", or use /transfer <task> <name or id>."
-        )
-        return
-
-    recipient = find_user_by_name(recipient_name)
-    if not recipient:
-        await update.message.reply_text(
-            f"No registered user matches \"{recipient_name}\". They need to message the bot "
-            f"and run /register <name> first, or you can use /transfer <task> <telegram_id>."
-        )
-        return
-
-    if list_position is not None:
-        tasks = get_scoped_tasks(update.effective_user.id)
-        task_id = resolve_list_position(update.effective_user.id, list_position)
-        task = next((t for t in tasks if str(t["id"]) == task_id), None) if task_id else None
-    else:
-        task = await resolve_task_by_description(
-            update.effective_user.id, user_message, get_current_category(update.effective_user.id)
-        )
-
-    if not task:
-        message = (
-            "I don't have a task at that position -- run /list first, then refer to a number from it."
-            if list_position is not None else
-            "I could not find a matching task of yours to transfer. Use /list to see your tasks."
-        )
-        await update.message.reply_text(message)
-        return
-
-    await do_transfer(update, context, str(task["id"]), recipient["telegram_user_id"], recipient.get("display_name"))
-
 async def transfer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Explicit fallback: /transfer <task id or description> <recipient name or telegram id>."""
+    """/transfer <task number or description> <recipient name or telegram id>."""
     if not is_authorized(update):
         return
     if not is_admin(update):
@@ -771,30 +637,24 @@ async def transfer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if len(context.args) < 2:
         await update.message.reply_text(
-            "Usage: /transfer <number, description, or task id> <recipient telegram id or registered name>"
+            "Usage: /transfer <task number or description> <recipient telegram id or registered name>"
         )
         return
 
     *task_words, recipient_arg = context.args
     task_query = " ".join(task_words)
 
-    tasks = get_scoped_tasks(update.effective_user.id)
-    task = None
-    if task_query.isdigit():
-        # e.g. "/transfer 2 sarah" -- position from the last /list.
-        task_id = resolve_list_position(update.effective_user.id, int(task_query))
-        task = next((t for t in tasks if str(t["id"]) == task_id), None) if task_id else None
-    if not task:
-        matched_by_id = [t for t in tasks if str(t["id"]).startswith(task_query)]
-        task = matched_by_id[0] if len(matched_by_id) == 1 else None
-    if not task:
-        task = await resolve_task_by_description(
-            update.effective_user.id, task_query, get_current_category(update.effective_user.id)
-        )
-
-    if not task:
+    result = _find_task_for_command(update.effective_user.id, task_query)
+    if result is None:
         await update.message.reply_text("Could not find a matching task of yours. Use /list to see your tasks.")
         return
+    if isinstance(result, list):
+        candidates = ", ".join(f"#{t['task_number']}" for t in result)
+        await update.message.reply_text(
+            f'Multiple tasks match "{task_query}" -- use its number instead to be specific: {candidates}'
+        )
+        return
+    task = result
 
     if recipient_arg.isdigit():
         recipient_id = int(recipient_arg)
@@ -803,7 +663,7 @@ async def transfer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         recipient_row = find_user_by_name(recipient_arg)
         if not recipient_row:
-            await update.message.reply_text(f"No registered user matches \"{recipient_arg}\".")
+            await update.message.reply_text(f'No registered user matches "{recipient_arg}".')
             return
         recipient_id = recipient_row["telegram_user_id"]
         recipient_label = recipient_row.get("display_name")
@@ -867,11 +727,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- *remind me to call mom tonight at 8pm*\n"
         "- *buy groceries tomorrow morning*\n"
         "- *submit application by Friday at 5pm*\n\n"
-        "You can also manage several tasks at once: \"mark all as done\", \"remove all my work tasks\".\n\n"
+        "You can also edit, delete, sort, or manage several tasks at once in plain language: "
+        "\"move task 3 to tomorrow at 5pm\", \"delete the dentist task\", \"show my tasks by priority\", "
+        "\"mark all as done\".\n\n"
+        "Every task has a permanent number (shown in /list) you can always refer back to.\n\n"
         "Commands:\n"
-        "/list [category] -- see pending tasks, optionally filtered\n"
-        "/category <name> -- like `cd`: scope /list, /done, /transfer, /clear, and new tasks to one category (/category all to reset)\n"
-        "/done <number, description, or id> -- mark a task complete\n"
+        "/list [category] [priority] -- see pending tasks, optionally filtered and/or sorted by priority\n"
+        "/category <name> -- like `cd`: scope /list, /done, /delete, /edit, /transfer, /clear, and new tasks to one category (/category all to reset)\n"
+        "/done <number or description> -- mark a task complete\n"
+        "/delete <number or description> -- permanently remove a task (cannot be undone)\n"
+        "/edit <number> <field> <value> -- change a task's description, category, priority, recurrence, or note\n"
         "/note <number> [text] -- set a detailed note on a task, or view it if you omit the text\n"
         "/priority <number> <1|2|3> -- set how often overdue nudges repeat (1=hourly, 2=every 6h, 3=every 12h, unset=every 24h)\n"
         "/completeall [category] -- mark all (or one category's) pending tasks complete\n"
@@ -946,6 +811,8 @@ def main():
     app.add_handler(CommandHandler("list", list_command))
     app.add_handler(CommandHandler("category", category_command))
     app.add_handler(CommandHandler("done", done_command))
+    app.add_handler(CommandHandler("delete", delete_command))
+    app.add_handler(CommandHandler("edit", edit_command))
     app.add_handler(CommandHandler("completeall", complete_all_command))
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("transfer", transfer_command))
@@ -957,6 +824,7 @@ def main():
     app.add_handler(CallbackQueryHandler(clear_callback, pattern="^clear_"))
     app.add_handler(CallbackQueryHandler(complete_all_callback, pattern="^completeall_"))
     app.add_handler(CallbackQueryHandler(done_callback, pattern="^done_"))
+    app.add_handler(CallbackQueryHandler(delete_callback, pattern="^delete_"))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
