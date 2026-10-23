@@ -74,7 +74,7 @@ Ask, and the bot lists everything you still have pending:
 
 Or use the command: `/list`
 
-Your tasks show up numbered and grouped by category, with their due dates. That number next to each task is permanent -- it's that task's number for as long as it exists, not just for this one list. You can refer to it any time afterward, in any message, even much later and even if you've switched `/category` or other tasks have come and gone since: "mark number 7 as done", "edit task 3", `/done 7`. You never have to run `/list` again just to "refresh" a number.
+Your tasks show up numbered and grouped by category, with their due dates. That number next to each task reflects your current list -- like any normal numbered to-do list, it shifts as things change: finish task 1, and what was task 2 becomes task 1. You can use the number right away, in your very next message: "mark number 7 as done", "edit task 3", `/done 7`. If some time has passed, or you're not sure anything's changed, run `/list` again first to make sure the number you have in mind is still current.
 
 To see just one category, say so, or add it after the command:
 
@@ -320,7 +320,7 @@ If the bot didn't understand a message, try rephrasing it more directly. For exa
 
 If a voice message got misheard, the bot always echoes back what it heard before acting on it, so you'll see right away if something didn't come through right. Just send it again, or type it instead.
 
-If referring to a task by number doesn't do what you expect, double check you've got the right number with `/list` -- each task's number is permanent and never changes, so unlike before, you don't need to re-run `/list` just to "refresh" it.
+If referring to a task by number doesn't do what you expect, run `/list` again first -- numbers reflect your current pending tasks, so completing, adding, or removing a task can shift what a given number points to.
 
 If you can't `/transfer` a task to someone, they need to have sent the bot at least one message already. Ask them to say hello to it first, then try again.
 

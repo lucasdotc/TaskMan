@@ -99,11 +99,11 @@ Every task has a `category` (e.g. `personal`, `work`, `school`, or anything else
 
 New tasks are the one place this isn't a soft default: while scoped to a category, the agent's `add_task` tool uses it unconditionally rather than letting Claude's own content-based guess override it. That mirrors real `cd` semantics: if you want a task filed elsewhere while scoped in, you switch first (`/category personal`), the same way you'd `cd` elsewhere before creating a file there.
 
-#### Referring to a task by its permanent number
+#### Referring to a task by its number
 
-Every task gets a permanent `task_number` (a plain incrementing integer, see `schema.sql`) the moment it's created, and keeps it forever -- it's never reused or renumbered, even after the task is completed or deleted. `/list` always shows this number next to each task, and it's what you refer back to afterward: "mark number 7 as done", "edit task 3", `/done 7`, `/edit 3 priority 1`.
+`/list` numbers every task it shows, 1, 2, 3... -- a plain position in the current pending list, not a stored ID. It's what you refer back to afterward: "mark number 7 as done", "edit task 3", `/done 7`, `/edit 3 priority 1`. Like a normal numbered to-do list, that number shifts as things change: complete task 1 and what was task 2 becomes task 1.
 
-This is deliberately *not* a recomputed position in your last `/list` (an earlier design here had that bug: a task's apparent position shifts every time something else is completed, added, or filtered out, so acting on a stale position could silently hit the wrong task, or nothing at all, especially if you'd changed `/category` scope in between). A `task_number` means the same row every time, so `get_task_by_number(number, telegram_user_id)` in `db.py` can resolve it directly -- scoped to the caller's own tasks, so a guessed or hallucinated number can never return someone else's task -- with no need to `/list` first and no risk of category-scope mismatches.
+Nothing caches "what was shown in your last /list" -- every command and every AI-agent tool resolves a number by re-running the same pending-tasks query fresh, at the moment it's used (`_task_at_position` in `bot.py`, `_resolve_position` in `agent.py`), scoped to whatever `/category` is currently active. That's what makes it safe: a number always means "whatever's at this position right now," so there's nothing to go stale, and no risk of resolving a number against a different category scope than the one it was shown in (an earlier version of this feature tried caching the last-shown order instead, which had exactly that bug). The cost is the flip side of the same coin: a number from a much earlier message, or from a `/list priority` view, isn't guaranteed to still mean what it meant then -- if there's any doubt, just `/list` again.
 
 #### Referring to a task by description
 
@@ -151,7 +151,7 @@ Takes the user's message plus some context (their Telegram ID, whether they're a
 
 #### Tools
 
-Each tool is a plain Python function (or, for the two that need Telegram, an async one) closed over the current request's `telegram_user_id` and `is_admin` -- never over anything from the model's own tool-call arguments. That's what keeps this safe to expose: `list_tasks`/`get_task`/`add_task`/`edit_task`/`delete_task`/`complete_task` all resolve a `task_number` through `db.get_task_by_number(number, telegram_user_id)`, so even a hallucinated or deliberately-crafted number can only ever touch a task actually owned by whoever is chatting. `transfer_task` goes further and re-checks the `is_admin` flag itself before doing anything, rather than trusting the system prompt to stop a non-admin from asking for one. `request_bulk_action` never touches the database directly -- it calls back into `bot.py`'s existing `handle_clear`/`handle_complete_all`, which show the same Yes/Cancel confirmation button the slash commands use, so a destructive bulk request always gets the same explicit confirmation regardless of how it was asked for.
+Each tool is a plain Python function (or, for the two that need Telegram, an async one) closed over the current request's `telegram_user_id` and `is_admin` -- never over anything from the model's own tool-call arguments. That's what keeps this safe to expose: `get_task`/`edit_task`/`delete_task`/`complete_task`/`transfer_task` all resolve a `task_number` by re-querying `telegram_user_id`'s own pending tasks and indexing into that result (`_resolve_position`), so even a hallucinated or deliberately-crafted number can only ever touch a task actually owned by whoever is chatting. `transfer_task` goes further and re-checks the `is_admin` flag itself before doing anything, rather than trusting the system prompt to stop a non-admin from asking for one. `request_bulk_action` never touches the database directly -- it calls back into `bot.py`'s existing `handle_clear`/`handle_complete_all`, which show the same Yes/Cancel confirmation button the slash commands use, so a destructive bulk request always gets the same explicit confirmation regardless of how it was asked for.
 
 #### Dates, priority, and category
 
@@ -179,12 +179,12 @@ Every function opens a connection, does its work, and closes it in a `finally` b
 
 #### Key functions
 
-- `save_task` inserts a new task (with its category and priority) and returns its UUID plus its permanent `task_number`
+- `save_task` inserts a new task (with its category and priority) and returns its UUID
 - `save_reminder` inserts a reminder row linked to a task, with a `scheduled_for` timestamp; `delete_unsent_reminders` removes a task's not-yet-fired reminders, used when its due date is edited so stale ones don't also fire
 - `get_due_reminders` returns all reminders where `scheduled_for <= NOW()` and `sent = FALSE` and the parent task isn't complete, including a 30-second buffer to catch reminders that are about to fire
 - `mark_reminder_sent` sets `sent = TRUE` on a reminder so it doesn't fire again
-- `get_pending_tasks` returns incomplete tasks for a user, optionally filtered to one category, sorted by due date (default) or by priority
-- `get_task_by_id` and `get_task_by_number` look up a single task by its internal UUID or its permanent user-facing number -- both can be scoped to an owning `telegram_user_id` so a guessed/leaked id can't act on someone else's task
+- `get_pending_tasks` returns incomplete tasks for a user, optionally filtered to one category, sorted by due date (default) or by priority -- there's no stored task number; a task's number is just its 1-based position in whatever this returns, resolved fresh by the caller every time (see `_task_at_position` in `bot.py`, `_resolve_position` in `agent.py`)
+- `get_task_by_id` looks up a single task by its internal UUID, optionally scoped to an owning `telegram_user_id` so a guessed/leaked id can't act on someone else's task
 - `update_task` changes only the fields passed to it (a field passed as `None` clears it, a field left out entirely is untouched) -- backs `/edit`, `/note`, `/priority`, and the AI agent's `edit_task` tool
 - `delete_task` permanently removes a task row (and, via cascade, its reminders) -- the one place a task is actually erased, rather than just soft-completed
 - `mark_task_complete` sets `is_complete = TRUE` on a task
@@ -237,8 +237,7 @@ psql "$DATABASE_URL" -f schema.sql
 ### `tasks`
 | Column | Type | Description |
 |---|---|---|
-| `id` | UUID | Primary key, auto-generated, internal only |
-| `task_number` | BIGINT | Permanent, user-facing task number (unique, never reused); this is what `/list` shows and every command/tool accepts |
+| `id` | UUID | Primary key, auto-generated, internal only -- there's no separate "task number" column; the number shown in `/list` is just that task's current position in the pending-tasks query, computed on the fly |
 | `telegram_user_id` | BIGINT | Telegram user ID of the current owner |
 | `description` | TEXT | What the task is |
 | `due_datetime` | TIMESTAMPTZ | When it's due (UTC) |

@@ -15,12 +15,13 @@ to be hand-coded for each one.
 Security note: every tool here is scoped to the telegram_user_id and
 is_admin flag passed in from bot.py (established by Telegram's own
 authentication, via ALLOWED_USER_ID/ADMIN_USER_ID), never from anything the
-model is given in its tool-call arguments. A task_number the model picks
-(even a hallucinated or user-suggested one) can only ever resolve to a task
-actually owned by that telegram_user_id -- see db.get_task_by_number -- and
-transfer_task re-checks is_admin itself rather than trusting the system
-prompt. So the worst a crafted message can do is act on the sender's own
-data, which they could already do through the ordinary commands.
+model is given in its tool-call arguments. A task_number the model picks is
+resolved as a position within that telegram_user_id's own pending-task
+query (see _resolve_position below) -- it can only ever land on a task
+actually owned by the caller, never someone else's. transfer_task
+re-checks is_admin itself rather than trusting the system prompt. So the
+worst a crafted message can do is act on the sender's own data, which they
+could already do through the ordinary commands.
 """
 import json
 import os
@@ -56,14 +57,16 @@ User's active category focus: {category_context}
 User's role: {role}
 
 Guidelines:
-- Every task has a permanent task number, included in every list_tasks/get_task result. Refer to \
-tasks by that number when confirming actions (e.g. "Marked #7 complete"). If the user mentions a \
-number ("edit task 3", "done with 7"), resolve it directly with get_task or the relevant tool --
-don't ask them to run /list first, and don't assume a number refers to a position in anything.
+- A task's number is just its current position in the pending list (1, 2, 3...), the same number \
+/list would show right now -- it is NOT a permanent ID. It shifts whenever a task is completed, \
+added, or removed, so a number from several messages ago, or from before you called a tool that \
+changes the list, may no longer point at the same task. If there's any doubt, call list_tasks (or \
+get_task) again before acting, rather than assuming an old number still applies. Within the same \
+reply, a number you just got from list_tasks/get_task is safe to act on immediately.
 - If the user refers to a task by description instead of a number, call list_tasks first, find the \
-best match yourself, then act on its task_number. If more than one task is a plausible match and \
-you can't tell which they mean, ask them to clarify (name the candidates with their numbers) \
-instead of guessing.
+best match yourself, then act on its current task_number from that same result. If more than one \
+task is a plausible match and you can't tell which they mean, ask them to clarify (name the \
+candidates with their numbers) instead of guessing.
 - due_datetime is always an ISO 8601 UTC datetime string, e.g. "2026-06-26T17:00:00Z". Convert \
 whatever the user said (today/tomorrow/Friday/in an hour/etc.) into UTC yourself using the current \
 time and timezone above. Leave it null if they mentioned no timing at all.
@@ -99,7 +102,7 @@ TOOLS = [
     },
     {
         "name": "get_task",
-        "description": "Get full details (including its note, if any) for one task by its permanent task number.",
+        "description": "Get full details (including its note, if any) for one task by its current task number (its position in the pending list).",
         "input_schema": {
             "type": "object",
             "properties": {"task_number": {"type": "integer"}},
@@ -244,9 +247,9 @@ async def run_agent(
             return None
         return dt.astimezone(local_tz).strftime("%A, %b %d at %I:%M %p")
 
-    def _task_summary(row: dict) -> dict:
+    def _task_summary(number: int, row: dict) -> dict:
         return {
-            "task_number": row["task_number"],
+            "task_number": number,
             "description": row["description"],
             "due": _fmt_due(row.get("due_datetime")),
             "category": row.get("category"),
@@ -256,26 +259,44 @@ async def run_agent(
             "assigned_to_you": bool(row.get("assigned_by")),
         }
 
+    def _resolve_position(position: int) -> dict | None:
+        """
+        Resolves a 1-based task number to a pending task row, scoped to the
+        active category focus -- the exact same list list_tasks would
+        return right now. Not cached: a number only ever means "whatever is
+        at this position as of this call," so it naturally tracks
+        completions/additions/removals without any extra bookkeeping.
+        """
+        tasks = db.get_pending_tasks(telegram_user_id, category=state["category_context"])
+        if 1 <= position <= len(tasks):
+            return tasks[position - 1]
+        return None
+
     def tool_list_tasks(args):
         category = args.get("category") or state["category_context"]
         if category:
             category = category.strip().lower()
         sort = args.get("sort") or "due"
         tasks = db.get_pending_tasks(telegram_user_id, category=category, sort=sort)
-        return {"tasks": [_task_summary(t) for t in tasks], "active_category_focus": state["category_context"]}
+        return {
+            "tasks": [_task_summary(i, t) for i, t in enumerate(tasks, 1)],
+            "active_category_focus": state["category_context"],
+            "note": "task_number is each task's position in THIS result, right now -- it shifts as tasks change, so don't reuse a number from an older result without re-listing.",
+        }
 
     def tool_get_task(args):
-        task = db.get_task_by_number(args["task_number"], telegram_user_id)
-        if not task or task["is_complete"]:
-            return {"error": f"No pending task numbered {args['task_number']} found."}
-        return _task_summary(task)
+        position = args["task_number"]
+        task = _resolve_position(position)
+        if not task:
+            return {"error": f"No pending task at position {position}. Call list_tasks to see current numbers."}
+        return _task_summary(position, task)
 
     def tool_add_task(args):
         category = (state["category_context"] or args.get("category") or "personal").strip().lower()
         due_datetime = _parse_due_datetime(args.get("due_datetime"))
         priority = args.get("priority")
         priority = priority if priority in (1, 2, 3) else None
-        created = db.save_task(
+        new_id = db.save_task(
             telegram_user_id=telegram_user_id,
             description=args["description"],
             due_datetime=due_datetime,
@@ -283,10 +304,18 @@ async def run_agent(
             category=category,
             priority=priority,
         )
-        _schedule_reminders(created["id"], due_datetime)
+        _schedule_reminders(new_id, due_datetime)
+
+        # The new task can land anywhere in the (due-date-ordered) pending
+        # list depending on its due date, not necessarily at the end -- so
+        # its number has to be found by looking the list up again rather
+        # than assumed.
+        tasks = db.get_pending_tasks(telegram_user_id, category=state["category_context"])
+        number = next((i for i, t in enumerate(tasks, 1) if str(t["id"]) == new_id), None)
+
         return {
             "created": {
-                "task_number": created["task_number"],
+                "task_number": number,
                 "description": args["description"],
                 "due": _fmt_due(due_datetime),
                 "category": category,
@@ -296,10 +325,10 @@ async def run_agent(
         }
 
     def tool_edit_task(args):
-        task_number = args["task_number"]
-        task = db.get_task_by_number(task_number, telegram_user_id)
+        position = args["task_number"]
+        task = _resolve_position(position)
         if not task:
-            return {"error": f"No task numbered {task_number} found."}
+            return {"error": f"No pending task at position {position}. Call list_tasks to see current numbers."}
 
         fields = {}
         for key in ("description", "category", "notes"):
@@ -321,21 +350,35 @@ async def run_agent(
             db.delete_unsent_reminders(str(task["id"]))
             _schedule_reminders(str(task["id"]), fields["due_datetime"])
 
-        return {"updated": _task_summary(updated)}
+        # Editing (especially the due date or category) can move this task
+        # to a different position, so the old number is no longer reported
+        # back -- the description is enough to confirm by.
+        return {
+            "updated": {
+                "description": updated["description"],
+                "due": _fmt_due(updated.get("due_datetime")),
+                "category": updated.get("category"),
+                "priority": updated.get("priority"),
+                "recurrence_rule": updated.get("recurrence_rule"),
+                "notes": updated.get("notes"),
+            }
+        }
 
     def tool_delete_task(args):
-        task = db.get_task_by_number(args["task_number"], telegram_user_id)
+        position = args["task_number"]
+        task = _resolve_position(position)
         if not task:
-            return {"error": f"No task numbered {args['task_number']} found."}
+            return {"error": f"No pending task at position {position}. Call list_tasks to see current numbers."}
         deleted = db.delete_task(str(task["id"]))
-        return {"deleted": {"task_number": deleted["task_number"], "description": deleted["description"]}}
+        return {"deleted": {"description": deleted["description"]}}
 
     def tool_complete_task(args):
-        task = db.get_task_by_number(args["task_number"], telegram_user_id)
-        if not task or task["is_complete"]:
-            return {"error": f"No pending task numbered {args['task_number']} found."}
+        position = args["task_number"]
+        task = _resolve_position(position)
+        if not task:
+            return {"error": f"No pending task at position {position}. Call list_tasks to see current numbers."}
         db.mark_task_complete(str(task["id"]))
-        return {"completed": {"task_number": task["task_number"], "description": task["description"]}}
+        return {"completed": {"description": task["description"]}}
 
     async def tool_request_bulk_action(args):
         action = args["action"]
@@ -355,9 +398,10 @@ async def run_agent(
     async def tool_transfer_task(args):
         if not is_admin:
             return {"error": "Only admins can transfer tasks."}
-        task = db.get_task_by_number(args["task_number"], telegram_user_id)
+        position = args["task_number"]
+        task = _resolve_position(position)
         if not task:
-            return {"error": f"No task numbered {args['task_number']} found."}
+            return {"error": f"No pending task at position {position}. Call list_tasks to see current numbers."}
         return await on_transfer(task, args["recipient_name"])
 
     sync_tools = {

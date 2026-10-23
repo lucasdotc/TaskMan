@@ -7,22 +7,22 @@ load_dotenv()
 def get_connection():
     return psycopg.connect(os.getenv("DATABASE_URL"))
 
-def save_task(telegram_user_id: int, description: str, due_datetime, recurrence_rule: str = None, category: str = "personal", priority: int = None) -> dict:
-    """Inserts a new task and returns its id and permanent task_number."""
+def save_task(telegram_user_id: int, description: str, due_datetime, recurrence_rule: str = None, category: str = "personal", priority: int = None) -> str:
+    """Inserts a new task and returns its id."""
     conn = get_connection()
     try:
-        with conn.cursor(row_factory=dict_row) as cur:
+        with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO tasks (telegram_user_id, description, due_datetime, recurrence_rule, category, priority)
                 VALUES(%s, %s, %s, %s, %s, %s)
-                RETURNING id, task_number
+                RETURNING id
                 """,
                 (telegram_user_id, description, due_datetime, recurrence_rule, category, priority)
             )
-            row = cur.fetchone()
+            task_id = cur.fetchone()[0]
             conn.commit()
-            return {"id": str(row["id"]), "task_number": row["task_number"]}
+            return str(task_id)
     finally:
         conn.close()
 
@@ -150,6 +150,12 @@ def get_pending_tasks(telegram_user_id: int, category: str = None, sort: str = "
     "priority" orders by priority instead (1 = most urgent first, unset
     tasks last), then due date, ignoring category grouping -- used by
     "/list priority" and whenever the AI agent is asked to sort by urgency.
+
+    There's no stored "task number" column: a task's number is just its
+    1-based position in this list, resolved fresh every time from whatever
+    is currently pending (see bot.py's _task_at_position and agent.py) --
+    so it naturally shifts as tasks are completed, added, or removed, the
+    same way a normal numbered to-do list would.
     """
     order_clause = (
         "priority ASC NULLS LAST, due_datetime ASC NULLS LAST" if sort == "priority"
@@ -160,7 +166,7 @@ def get_pending_tasks(telegram_user_id: int, category: str = None, sort: str = "
     try:
         with conn.cursor(row_factory=dict_row) as cur:
             query = f"""
-                SELECT id, task_number, description, due_datetime, recurrence_rule,
+                SELECT id, description, due_datetime, recurrence_rule,
                        category, assigned_by, priority, notes
                 FROM tasks
                 WHERE telegram_user_id = %s
@@ -185,40 +191,18 @@ def get_task_by_id(task_id: str, telegram_user_id: int = None) -> dict | None:
         with conn.cursor(row_factory=dict_row) as cur:
             if telegram_user_id is not None:
                 cur.execute(
-                    """SELECT id, task_number, description, due_datetime, recurrence_rule,
+                    """SELECT id, description, due_datetime, recurrence_rule,
                               category, assigned_by, priority, notes, telegram_user_id, is_complete
                        FROM tasks WHERE id = %s AND telegram_user_id = %s""",
                     (task_id, telegram_user_id)
                 )
             else:
                 cur.execute(
-                    """SELECT id, task_number, description, due_datetime, recurrence_rule,
+                    """SELECT id, description, due_datetime, recurrence_rule,
                               category, assigned_by, priority, notes, telegram_user_id, is_complete
                        FROM tasks WHERE id = %s""",
                     (task_id,)
                 )
-            return cur.fetchone()
-    finally:
-        conn.close()
-
-def get_task_by_number(task_number: int, telegram_user_id: int) -> dict | None:
-    """
-    Looks up a task by its permanent, user-facing number, scoped to the
-    caller's own tasks -- so a guessed or hallucinated number can never
-    return someone else's task. This is the primary way both the bot's
-    slash commands and the AI agent (see agent.py) resolve "task 7" to an
-    actual row: it works regardless of category scoping, /list history, or
-    whether the task is still pending.
-    """
-    conn = get_connection()
-    try:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                """SELECT id, task_number, description, due_datetime, recurrence_rule,
-                          category, assigned_by, priority, notes, telegram_user_id, is_complete
-                   FROM tasks WHERE task_number = %s AND telegram_user_id = %s""",
-                (task_number, telegram_user_id)
-            )
             return cur.fetchone()
     finally:
         conn.close()
@@ -250,7 +234,7 @@ def update_task(task_id: str, **fields) -> dict | None:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 f"""UPDATE tasks SET {set_clause} WHERE id = %s
-                    RETURNING id, task_number, description, due_datetime, recurrence_rule,
+                    RETURNING id, description, due_datetime, recurrence_rule,
                               category, priority, notes""",
                 values + [task_id]
             )
@@ -266,14 +250,14 @@ def delete_task(task_id: str) -> dict | None:
     key's ON DELETE CASCADE -- any of its reminders along with it. Unlike
     mark_task_complete/mark_all_tasks_complete, which only ever soft-
     complete a task, this is the one place a task row is actually erased.
-    Returns the deleted row's id/task_number/description, or None if
-    task_id didn't match anything.
+    Returns the deleted row's id/description, or None if task_id didn't
+    match anything.
     """
     conn = get_connection()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "DELETE FROM tasks WHERE id = %s RETURNING id, task_number, description",
+                "DELETE FROM tasks WHERE id = %s RETURNING id, description",
                 (task_id,)
             )
             deleted = cur.fetchone()
@@ -350,7 +334,7 @@ def transfer_task(task_id: str, new_owner_id: int, assigned_by: int) -> dict | N
                 UPDATE tasks
                 SET telegram_user_id = %s, assigned_by = %s
                 WHERE id = %s
-                RETURNING id, task_number, description, due_datetime, category
+                RETURNING id, description, due_datetime, category
                 """,
                 (new_owner_id, assigned_by, task_id)
             )
